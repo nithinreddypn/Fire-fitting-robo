@@ -600,6 +600,21 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             text-shadow: 0 0 10px rgba(192,132,252,0.7);
         }
 
+        /* Auto Mode Relay toggle */
+        .auto-switch input:checked + .slider-toggle {
+            background: linear-gradient(135deg, #78350F, #D97706);
+            border-color: var(--gold-bright);
+            box-shadow: 0 0 16px rgba(245,200,66,0.35);
+        }
+        .auto-switch input:checked + .slider-toggle:before {
+            background: radial-gradient(circle at 35% 35%, #FEF3C7, var(--gold-bright));
+            box-shadow: 0 0 12px rgba(245,200,66,0.7);
+        }
+        .control-row.auto-on .value-display {
+            color: var(--gold-bright);
+            text-shadow: 0 0 10px rgba(245,200,66,0.7);
+        }
+
         .switch input:disabled + .slider-toggle {
             opacity: 0.35; cursor: not-allowed;
         }
@@ -838,16 +853,15 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
 
     </div>
 
-    <!-- Fire Suppression Switches -->
+    <!-- Fire Suppression & Actuation Switches -->
     <div class="bottom-section">
         <div class="control-group switches-container" id="relayControl">
-            <div class="section-title">Suppression Systems</div>
+            <div class="section-title">Suppression & Actuation Systems</div>
 
-            <!-- Water -->
+            <!-- Water Cannon Relay -->
             <div class="control-row" id="waterRow">
                 <div class="control-label">
-                    Water Cannon
-                    <span class="locked-hint" id="waterLockedHint">(locked)</span>
+                    💧 Water Cannon Relay
                 </div>
                 <div class="control-widget">
                     <label class="switch water-switch">
@@ -858,19 +872,33 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
                 <div class="value-display" id="RelayStatus">OFF</div>
             </div>
 
-            <!-- Sonic Wave Cannon (TPA3116D2 Acoustic Suppression) -->
-            <div class="control-row" id="sonicRow">
+            <!-- Auto Mode Relay (Physical Relay on Pin 15 / 17) -->
+            <div class="control-row" id="autoRelayRow">
                 <div class="control-label">
-                    🔊 Sonic Wave Cannon
-                    <span class="locked-hint" id="gasLockedHint">(locked)</span>
+                    ⚡ Auto Mode Relay
                 </div>
                 <div class="control-widget">
-                    <label class="switch sonic-switch">
-                        <input type="checkbox" id="Relay2" aria-label="Sonic wave cannon">
+                    <label class="switch auto-switch">
+                        <input type="checkbox" id="AMRelay" aria-label="Auto Mode Relay">
                         <span class="slider-toggle"></span>
                     </label>
                 </div>
-                <div class="value-display" id="Relay2Status">OFF</div>
+                <div class="value-display" id="AMRelayStatus">OFF</div>
+            </div>
+
+            <!-- TP3110 Acoustic Cannon (Direct ESP32 DAC2 GPIO 26, No Relay) -->
+            <div class="control-row" id="ampRow">
+                <div class="control-label">
+                    🔊 TP3110 Acoustic Cannon
+                    <span style="display:block;font-size:10px;color:var(--text-mid);letter-spacing:0.5px;font-family:'DM Mono',monospace;">Direct ESP32 DAC2 · Extinguish Flame</span>
+                </div>
+                <div class="control-widget">
+                    <label class="switch sonic-switch">
+                        <input type="checkbox" id="Amp" aria-label="TP3110 Acoustic Cannon">
+                        <span class="slider-toggle"></span>
+                    </label>
+                </div>
+                <div class="value-display" id="AmpStatus">OFF</div>
             </div>
         </div>
     </div>
@@ -1076,17 +1104,19 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
                 if (el) send(id, el.value);
             });
             send("Relay", "0");
-            send("Relay2", "0");
             send("AMRelay", currentMode === "auto" ? "1" : "0");
+            send("Amp", "0");
+            send("Relay2", "0");
         };
         ws.onclose = function () {
             var wasMoving = !!currentDirection;
             isConnected = false;
             setStatus("Disconnected - reconnecting...", false);
             stopMovementLocal();
-            var w = $("Relay"), s = $("Relay2");
+            var w = $("Relay"), a = $("AMRelay"), m = $("Amp");
             if (w) w.checked = false;
-            if (s) s.checked = false;
+            if (a) a.checked = false;
+            if (m) m.checked = false;
             refreshRelayUI();
 
             // Disconnects: stays in the bar in red until connection returns
@@ -1231,39 +1261,30 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
         }
     }
 
-    /* ── Relays ── */
+    /* ── Relays & TP3110 Amplifier ── */
     function refreshRelayUI() {
-        var water = $("Relay"), sonic = $("Relay2");
+        var water = $("Relay"), autoR = $("AMRelay"), amp = $("Amp");
         var w = water ? water.checked : false;
-        var s = sonic ? sonic.checked : false;
+        var a = autoR ? autoR.checked : false;
+        var m = amp ? amp.checked : false;
 
         var rs = $("RelayStatus"); if (rs) rs.textContent  = w ? "ON" : "OFF";
-        var r2s = $("Relay2Status"); if (r2s) r2s.textContent = s ? "ON" : "OFF";
+        var as = $("AMRelayStatus"); if (as) as.textContent = a ? "ON" : "OFF";
+        var ms = $("AmpStatus"); if (ms) ms.textContent   = m ? "ON" : "OFF";
 
         var wr = $("waterRow"); if (wr) wr.classList.toggle("water-on", w);
-        var sr = $("sonicRow"); if (sr) sr.classList.toggle("sonic-on", s);
+        var ar = $("autoRelayRow"); if (ar) ar.classList.toggle("auto-on", a);
+        var mr = $("ampRow"); if (mr) mr.classList.toggle("sonic-on", m);
         var rc = $("relayControl");
         if (rc) {
             rc.classList.toggle("firing-water", w);
-            rc.classList.toggle("firing-sonic", s);
+            rc.classList.toggle("firing-sonic", m);
         }
-
-        if (sonic) sonic.disabled = w;
-        if (water) water.disabled = s;
-        var gh = $("gasLockedHint"); if (gh) gh.classList.toggle("show", w);
-        var wh = $("waterLockedHint"); if (wh) wh.classList.toggle("show", s);
     }
 
     function handleWater(state) {
-        var sonic = $("Relay2"), water = $("Relay");
-        if (state && sonic && sonic.checked) {
-            if (water) water.checked = false;
-            refreshRelayUI();
-            notify("Turn off Sonic Wave Cannon first", "warn", { key: "lock" });
-            return;
-        }
         if (state && !requireConn("Not connected - Water Cannon not started")) {
-            if (water) water.checked = false;
+            var water = $("Relay"); if (water) water.checked = false;
             refreshRelayUI();
             return;
         }
@@ -1272,23 +1293,34 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
         notify(state ? "Water Cannon ON" : "Water Cannon OFF", state ? "water" : "gold",
                { key: "water", ttl: state ? 3000 : 2000 });
     }
-    function handleSonic(state) {
-        var water = $("Relay"), sonic = $("Relay2");
-        if (state && water && water.checked) {
-            if (sonic) sonic.checked = false;
-            refreshRelayUI();
-            notify("Turn off Water Cannon first", "warn", { key: "lock" });
-            return;
-        }
-        if (state && !requireConn("Not connected - Sonic Cannon not started")) {
-            if (sonic) sonic.checked = false;
+
+    function handleAutoRelay(state) {
+        if (state && !requireConn("Not connected - Auto Mode Relay not changed")) {
+            var autoR = $("AMRelay"); if (autoR) autoR.checked = false;
             refreshRelayUI();
             return;
         }
-        send("Relay2", state ? "1" : "0");
+        send("AMRelay", state ? "1" : "0");
         refreshRelayUI();
-        notify(state ? "Sonic Wave Cannon ON" : "Sonic Wave Cannon OFF", state ? "sonic" : "gold",
-               { key: "sonic", ttl: state ? 3000 : 2000 });
+        notify(state ? "Auto Mode Relay ON" : "Auto Mode Relay OFF", state ? "gold" : "gold",
+               { key: "autorelay", ttl: state ? 3000 : 2000 });
+    }
+
+    function handleAmp(state) {
+        if (state && !requireConn("Not connected - TP3110 Acoustic Cannon not started")) {
+            var amp = $("Amp"); if (amp) amp.checked = false;
+            refreshRelayUI();
+            return;
+        }
+        send("Amp", state ? "1" : "0");
+        send("Relay2", state ? "1" : "0"); // Backward-compatibility
+        refreshRelayUI();
+        notify(state ? "TP3110 Acoustic Extinguisher ACTIVE" : "TP3110 Acoustic Standby", state ? "sonic" : "gold",
+               { key: "amp", ttl: state ? 3000 : 2000 });
+    }
+
+    function handleSonic(state) {
+        handleAmp(state);
     }
 
     function bindLockedNotice() {
@@ -1416,16 +1448,23 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
     window.stopMovement = stopMovement;
     window.stopCar = stopCar;
     window.handleWater = handleWater;
-    window.handleSonic = handleSonic;
-    window.handleGas = handleSonic;
+    window.handleAutoRelay = handleAutoRelay;
+    window.handleAmp = handleAmp;
+    window.handleSonic = handleAmp;
+    window.handleGas = handleAmp;
     window.toggleWater = function () {
         var el = $("Relay");
         if (el) { el.checked = !el.checked; handleWater(el.checked); }
     };
-    window.toggleSonic = function () {
-        var el = $("Relay2");
-        if (el) { el.checked = !el.checked; handleSonic(el.checked); }
+    window.toggleAutoRelay = function () {
+        var el = $("AMRelay");
+        if (el) { el.checked = !el.checked; handleAutoRelay(el.checked); }
     };
+    window.toggleAmp = function () {
+        var el = $("Amp");
+        if (el) { el.checked = !el.checked; handleAmp(el.checked); }
+    };
+    window.toggleSonic = window.toggleAmp;
     window.updateSliderValue = function (id, val) {
         paintSlider(id, val);
         send(id, val);
@@ -1457,10 +1496,10 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             });
         });
         bindDpad();
-        bindLockedNotice();
-        var r1 = $("Relay"), r2 = $("Relay2");
+        var r1 = $("Relay"), r2 = $("AMRelay"), r3 = $("Amp");
         if (r1) r1.addEventListener("change", function () { handleWater(this.checked); });
-        if (r2) r2.addEventListener("change", function () { handleSonic(this.checked); });
+        if (r2) r2.addEventListener("change", function () { handleAutoRelay(this.checked); });
+        if (r3) r3.addEventListener("change", function () { handleAmp(this.checked); });
         refreshRelayUI();
 
         var notifBar = $("notifBar");

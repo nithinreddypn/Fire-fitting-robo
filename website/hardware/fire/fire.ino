@@ -35,9 +35,9 @@
   #define MOTOR_PWM_WRITE(pin, ch, duty)       ledcWrite(ch, duty)
 #endif
 
-// ── Acoustic Audio Cannon (TPA3116D2 + 8Ω 0.5W Speaker) ──
-#define DAC_AUDIO_PIN   26  // ESP32 DAC2 (GPIO 26) -> TPA3116D2 Audio IN
-#define AUDIO_VOLUME    55  // Dynamic range clamp (safe level for 8Ω 0.5W speaker; 3-layer protection)
+// ── Acoustic Audio Cannon (TPA3110 Power Amplifier + Extinguisher Speaker) ──
+#define DAC_AUDIO_PIN   26   // ESP32 DAC2 (GPIO 26) -> TPA3110 Audio IN (Direct Connection, No Relay)
+#define AUDIO_VOLUME    115  // High acoustic pressure amplitude for flame boundary extinction
 volatile bool sonicWaveActive = false;
 TaskHandle_t audioTaskHandle = NULL;
 
@@ -108,13 +108,13 @@ void setAllOff() {
 
 // ── System Status Evaluation (RobotStatus enum defined in robot_status.h) ──
 RobotStatus getSystemStatus() {
+  if (sonicWaveActive) {
+    return STATUS_SONIC_ACTIVE;
+  }
   if (digitalRead(RELAY_PIN) == HIGH) {
     return STATUS_WATER_ACTIVE;
   }
-  if (digitalRead(RELAY2_PIN) == HIGH || sonicWaveActive) {
-    return STATUS_SONIC_ACTIVE;
-  }
-  if (digitalRead(AM_RELAY_PIN) == HIGH) {
+  if (digitalRead(AM_RELAY_PIN) == HIGH || digitalRead(RELAY2_PIN) == HIGH) {
     return STATUS_AUTO_MODE;
   }
   if (wsCarInput.count() == 0) {
@@ -259,11 +259,8 @@ void bootAnimation() {
 
 
 // ── Acoustic Fire Suppression Audio Engine (FreeRTOS Task on Core 0) ──
-// Hardware: ESP32 DAC2 (GPIO 26) -> TPA3116D2 Amplifier -> 8Ω 0.5W Speaker
-// 3-Layer Speaker Protection:
-//   1. Software Dynamic Range Clamping (AUDIO_VOLUME = 55 peak-to-peak)
-//   2. Hardware Potentiometer Attenuation (recommended 25%-40% gain)
-//   3. Zero DC Standby Heating: DAC parked at 128 bias (1.65V DC). AC-coupling cap blocks DC entirely (0.00V AC, 0 mA)
+// Hardware: ESP32 DAC2 (GPIO 26) -> TPA3110 Power Amplifier -> Acoustic Extinguisher Speaker
+// Features: Direct ESP32 DAC connection (NO RELAY) for instantaneous acoustic suppression
 void taskAcousticOutput(void *pvParameters) {
   // Initialize DAC2 on GPIO 26 ONLY
   dac_output_enable(DAC_CHANNEL_2);
@@ -281,7 +278,7 @@ void taskAcousticOutput(void *pvParameters) {
     float phase = 0.0f;
     float phaseInc = 2.0f * PI * freq / 8000.0f;
     while (millis() - noteStart < 160) {
-      uint8_t sample = 128 + (int8_t)(sinf(phase) * (AUDIO_VOLUME * 0.65f));
+      uint8_t sample = 128 + (int8_t)(sinf(phase) * (AUDIO_VOLUME * 0.45f));
       dac_output_voltage(DAC_CHANNEL_2, sample);
       phase += phaseInc;
       if (phase >= 2.0f * PI) phase -= 2.0f * PI;
@@ -291,7 +288,7 @@ void taskAcousticOutput(void *pvParameters) {
   // Park at midpoint standby bias
   dac_output_voltage(DAC_CHANNEL_2, 128);
 
-  // 2. Synthesized Low-Frequency Acoustic Wave Loop
+  // 2. Synthesized Low-Frequency Acoustic Vortex Wave Loop (Acoustic Flame Extinction)
   unsigned long sampleIndex = 0;
   const float sampleRate = 8000.0f;
 
@@ -303,14 +300,14 @@ void taskAcousticOutput(void *pvParameters) {
 
         float t = (float)sampleIndex / sampleRate;
 
-        // Multi-Harmonic Vortex Synthesis:
-        // Fundamental (120 Hz) + 2nd Harmonic (240 Hz) + 3rd Harmonic (360 Hz)
-        // Modulated by a 10 Hz amplitude envelope for flame boundary layer vortex shedding
-        float wave = 0.55f * sinf(2.0f * PI * 120.0f * t)
-                   + 0.30f * sinf(2.0f * PI * 240.0f * t)
-                   + 0.15f * sinf(2.0f * PI * 360.0f * t);
+        // Acoustic Vortex Flame Extinction Synthesis:
+        // Core boundary-layer displacement frequency: 45 Hz (maximum air packet displacement for flame disruption)
+        // 1st harmonic: 90 Hz
+        // 8 Hz low-frequency vortex pulsation envelope (produces high-velocity air puffs that blow out flame)
+        float wave = 0.70f * sinf(2.0f * PI * 45.0f * t)
+                   + 0.30f * sinf(2.0f * PI * 90.0f * t);
 
-        float envelope = 0.75f + 0.25f * sinf(2.0f * PI * 10.0f * t);
+        float envelope = 0.70f + 0.30f * sinf(2.0f * PI * 8.0f * t);
         float sampleFloat = wave * envelope * (float)AUDIO_VOLUME;
 
         int sampleInt = 128 + (int)sampleFloat;
@@ -329,7 +326,7 @@ void taskAcousticOutput(void *pvParameters) {
     } else {
       // STANDBY / OFF STATUS:
       // Clamp DAC at exact midpoint bias (128 = 1.65V).
-      // AC capacitor on amplifier completely blocks DC: 0.00 V AC reaches speaker, 0 mA, zero heating!
+      // AC capacitor on TPA3110 amplifier completely blocks DC: 0.00 V AC reaches speaker, 0 mA, zero heating!
       dac_output_voltage(DAC_CHANNEL_2, 128);
       sampleIndex = 0;
       vTaskDelay(pdMS_TO_TICKS(40));
@@ -525,19 +522,24 @@ void onCarInputWebSocketEvent(AsyncWebSocket *server,
           camTiltServo.write(valueInt);
           Serial.printf("CamTilt servo set to: %d\n", valueInt);
         }
-        else if (key == "Relay2")
+        else if (key == "Amp" || key == "Relay2")
         {
+          // Direct ESP32 DAC2 Acoustic Extinguisher Cannon (TP3110 Power Amp, NO RELAY)
           sonicWaveActive = (valueInt == 1);
-          digitalWrite(RELAY2_PIN, valueInt == 1 ? HIGH : LOW);
-          Serial.printf("Sonic Wave Cannon: %s (Relay %d & DAC2 Acoustic Engine)\n", sonicWaveActive ? "ACTIVE" : "STANDBY", RELAY2_PIN);
+          Serial.printf("TP3110 Acoustic Cannon: %s (Direct ESP32 DAC2 GPIO 26 -> TP3110, No Relay)\n", 
+                        sonicWaveActive ? "ACTIVE [FIRE EXTINCTION SOUND ON]" : "STANDBY [SILENT]");
         }
         else if (key == "Relay")
         {
           digitalWrite(RELAY_PIN, valueInt == 1 ? HIGH : LOW);
+          Serial.printf("Water Cannon Relay (Pin %d): %s\n", RELAY_PIN, valueInt == 1 ? "ON" : "OFF");
         }
         else if (key == "AMRelay")
         {
+          // Auto Mode Relay - Drive both Pin 15 and Pin 17 for physical board compatibility
           digitalWrite(AM_RELAY_PIN, valueInt == 1 ? HIGH : LOW);
+          digitalWrite(RELAY2_PIN, valueInt == 1 ? HIGH : LOW);
+          Serial.printf("Auto Mode Relay (Pins %d & %d): %s\n", AM_RELAY_PIN, RELAY2_PIN, valueInt == 1 ? "ON" : "OFF");
         }              
       }
       break;
