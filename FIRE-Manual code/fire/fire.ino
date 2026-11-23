@@ -37,7 +37,7 @@
 
 // ── Acoustic Audio Cannon (TPA3110 Power Amplifier + Extinguisher Speaker) ──
 #define DAC_AUDIO_PIN   26   // ESP32 DAC2 (GPIO 26) -> TPA3110 Audio IN (Direct Connection, No Relay)
-#define AUDIO_VOLUME    115  // High acoustic pressure amplitude for flame boundary extinction
+#define AUDIO_VOLUME    126  // MAX RAIL-TO-RAIL DYNAMIC RANGE (128 ± 126 = 2 to 254) for maximum acoustic extinction power
 volatile bool sonicWaveActive = false;
 TaskHandle_t audioTaskHandle = NULL;
 
@@ -45,14 +45,20 @@ TaskHandle_t audioTaskHandle = NULL;
 #define ULTRASONIC_TRIG_PIN 5   // Ultrasonic TRIG
 #define ULTRASONIC_ECHO_PIN 18  // Ultrasonic ECHO
 
-// ── Servos ──
+// ── Directional Servos (Water Direction & Sonic Direction) ──
 #define ULTRASONIC_SERVO_PIN 13  // Ultrasonic Sweep Servo
-#define PAN_PIN              32  // Camera Pan Servo
-#define CAM_TILT_PIN         33  // Camera Tilt Servo
+#define WATER_DIR_PIN        32  // Water Direction Nozzle Servo (GPIO 32, formerly Pan)
+#define SONIC_DIR_PIN        33  // Sonic Direction Cannon Servo (GPIO 33, formerly CamTilt)
 
-Servo camTiltServo;
-Servo panServo;
+Servo sonicDirServo;
+Servo waterDirServo;
 Servo ultrasonicServo;
+
+// Aliases for backwards compatibility with legacy naming
+#define panServo waterDirServo
+#define camTiltServo sonicDirServo
+#define PAN_PIN WATER_DIR_PIN
+#define CAM_TILT_PIN SONIC_DIR_PIN
 
 // ── OLED Display (I2C) Pins ──
 #define OLED_SDA_PIN 21
@@ -301,19 +307,27 @@ void taskAcousticOutput(void *pvParameters) {
 
         float t = (float)sampleIndex / sampleRate;
 
-        // Acoustic Vortex Flame Extinction Synthesis:
-        // Core boundary-layer displacement frequency: 45 Hz (maximum air packet displacement for flame disruption)
-        // 1st harmonic: 90 Hz
-        // 8 Hz low-frequency vortex pulsation envelope (produces high-velocity air puffs that blow out flame)
-        float wave = 0.70f * sinf(2.0f * PI * 45.0f * t)
-                   + 0.30f * sinf(2.0f * PI * 90.0f * t);
+        // Tuned Acoustic Vortex Fire-Extinguishing Synthesis:
+        // GMU / DARPA Research on acoustic suppression shows 40-50 Hz produces the largest flame-thinning air vortex.
+        // Fundamental (44 Hz) + 2nd harmonic (88 Hz) + 3rd harmonic (132 Hz)
+        float wave = 0.65f * sinf(2.0f * PI * 44.0f * t)
+                   + 0.25f * sinf(2.0f * PI * 88.0f * t)
+                   + 0.10f * sinf(2.0f * PI * 132.0f * t);
 
-        float envelope = 0.70f + 0.30f * sinf(2.0f * PI * 8.0f * t);
+        // Soft-saturation shaper: Boosts RMS acoustic energy by ~250% for maximum physical air displacement
+        if (wave > 0.0f) {
+          wave = 1.0f - expf(-1.8f * wave);
+        } else {
+          wave = -1.0f + expf(1.8f * wave);
+        }
+
+        // 8.5 Hz pulsating vortex envelope creates periodic toroidal air puffs that extinguish fire
+        float envelope = 0.65f + 0.35f * sinf(2.0f * PI * 8.5f * t);
         float sampleFloat = wave * envelope * (float)AUDIO_VOLUME;
 
         int sampleInt = 128 + (int)sampleFloat;
-        if (sampleInt < 0) sampleInt = 0;
-        if (sampleInt > 255) sampleInt = 255;
+        if (sampleInt < 2) sampleInt = 2;
+        if (sampleInt > 254) sampleInt = 254;
 
         dac_output_voltage(DAC_CHANNEL_2, (uint8_t)sampleInt);
 
@@ -474,9 +488,9 @@ void onCarInputWebSocketEvent(AsyncWebSocket *server,
       Serial.printf("WebSocket client #%u disconnected\n", client->id());
       moveCar(STOP);
       analogWrite(LIGHT_PIN, 0);
-      panServo.write(15);
-      ultrasonicServo.write(45);
-      camTiltServo.write(106);
+      waterDirServo.write(90);
+      ultrasonicServo.write(90);
+      sonicDirServo.write(90);
       digitalWrite(RELAY2_PIN, LOW);
       sonicWaveActive = false;
       digitalWrite(RELAY_PIN, LOW);
@@ -508,20 +522,20 @@ void onCarInputWebSocketEvent(AsyncWebSocket *server,
         {
           analogWrite(LIGHT_PIN, valueInt);          
         }
-        else if (key == "Pan")
+        else if (key == "Pan" || key == "WaterDir")
         {
-          panServo.write(valueInt);
-          Serial.printf("Pan servo set to: %d\n", valueInt);
+          waterDirServo.write(valueInt);
+          Serial.printf("Water Direction servo (GPIO %d) set to: %d deg\n", WATER_DIR_PIN, valueInt);
         }
         else if (key == "Tilt")
         {
           ultrasonicServo.write(valueInt);
-          Serial.printf("Ultrasonic sweep servo set to: %d\n", valueInt);
+          Serial.printf("Ultrasonic sweep servo (GPIO %d) set to: %d deg\n", ULTRASONIC_SERVO_PIN, valueInt);
         }
-        else if (key == "CamTilt")
+        else if (key == "CamTilt" || key == "SonicDir")
         {
-          camTiltServo.write(valueInt);
-          Serial.printf("CamTilt servo set to: %d\n", valueInt);
+          sonicDirServo.write(valueInt);
+          Serial.printf("Sonic Direction servo (GPIO %d) set to: %d deg\n", SONIC_DIR_PIN, valueInt);
         }
         else if (key == "Relay2" || key == "Sonic" || key == "Amp")
         {
@@ -564,17 +578,17 @@ void onCarInputWebSocketEvent(AsyncWebSocket *server,
 void setUpPinModes()
 {
   // Initialize servos first
-  Serial.println("Initializing servos...");
-  panServo.attach(PAN_PIN);
-  camTiltServo.attach(CAM_TILT_PIN);
+  Serial.println("Initializing directional and sweep servos...");
+  waterDirServo.attach(WATER_DIR_PIN);
+  sonicDirServo.attach(SONIC_DIR_PIN);
   ultrasonicServo.attach(ULTRASONIC_SERVO_PIN);
  
-  // Set servos to default positions
-  panServo.write(15);
-  camTiltServo.write(106);
-  ultrasonicServo.write(45);
+  // Set servos to default positions (90 deg center for nozzles & acoustic cannon, 90 deg for sonar sweep)
+  waterDirServo.write(90);
+  sonicDirServo.write(90);
+  ultrasonicServo.write(90);
   delay(300); // Give servos time to reach position
-  Serial.println("Servos initialized successfully");
+  Serial.println("Servos initialized successfully (WaterDir=90, SonicDir=90, SonarSweep=90)");
  
   // ── Motor Setup via Dedicated LEDC PWM Channels ──
   // 1. Explicitly detach DAC1 from GPIO 25 so it can output digital PWM

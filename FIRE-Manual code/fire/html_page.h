@@ -828,21 +828,21 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             </div>
 
             <div class="control-row" id="panControl">
-                <div class="control-label">Cam Pan</div>
-                <div class="control-widget"><input type="range" min="0" max="180" value="15" class="slider" id="Pan" aria-label="Camera pan"></div>
-                <div class="value-display" id="PanValue">15°</div>
+                <div class="control-label">💧 Water Direction</div>
+                <div class="control-widget"><input type="range" min="0" max="180" value="90" class="slider" id="Pan" aria-label="Water Direction"></div>
+                <div class="value-display" id="PanValue">90°</div>
             </div>
 
             <div class="control-row" id="tiltControl">
-                <div class="control-label">Cam Tilt</div>
-                <div class="control-widget"><input type="range" min="0" max="180" value="106" class="slider" id="CamTilt" aria-label="Camera tilt"></div>
-                <div class="value-display" id="CamTiltValue">106°</div>
+                <div class="control-label">🔊 Sonic Direction</div>
+                <div class="control-widget"><input type="range" min="0" max="180" value="90" class="slider" id="CamTilt" aria-label="Sonic Direction"></div>
+                <div class="value-display" id="CamTiltValue">90°</div>
             </div>
 
             <div class="control-row" id="wDirectionControl">
                 <div class="control-label">Sonar Sweep</div>
-                <div class="control-widget"><input type="range" min="0" max="180" value="45" class="slider" id="Tilt" aria-label="Sonar sweep"></div>
-                <div class="value-display" id="TiltValue">45°</div>
+                <div class="control-widget"><input type="range" min="0" max="180" value="90" class="slider" id="Tilt" aria-label="Sonar sweep"></div>
+                <div class="value-display" id="TiltValue">90°</div>
             </div>
 
             <div class="status connecting" id="connectionStatus">
@@ -903,7 +903,7 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
 
     var DEG_KEYS = ["Pan", "CamTilt", "Tilt"];
     var SLIDERS  = ["Speed", "Light", "Pan", "CamTilt", "Tilt"];
-    var LABELS   = { Speed: "Speed", Light: "Headlight", Pan: "Cam Pan", CamTilt: "Cam Tilt", Tilt: "Sonar Sweep" };
+    var LABELS   = { Speed: "Speed", Light: "Headlight", Pan: "Water Direction", CamTilt: "Sonic Direction", Tilt: "Sonar Sweep" };
     var DIR_TEXT = { up: "Moving forward", down: "Reversing", left: "Turning left", right: "Turning right" };
 
     function $(id) { return document.getElementById(id); }
@@ -1298,29 +1298,6 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
         });
     }
 
-    /* ── Auto sweep ── */
-    function startAutoSweep() {
-        stopAutoSweep();
-        panValue = parseInt($("Pan") ? $("Pan").value : 15, 10) || 15;
-        camTiltValue = parseInt($("CamTilt") ? $("CamTilt").value : 106, 10) || 106;
-        sweepInterval = setInterval(function () {
-            panValue += panDir * SWEEP_STEP;
-            if (panValue >= 165) { panValue = 165; panDir = -1; }
-            if (panValue <= 15)  { panValue = 15;  panDir =  1; }
-            paintSlider("Pan", panValue);
-            send("Pan", panValue);
-
-            camTiltValue += camTiltDir * SWEEP_STEP;
-            if (camTiltValue >= 140) { camTiltValue = 140; camTiltDir = -1; }
-            if (camTiltValue <= 70)  { camTiltValue = 70;  camTiltDir =  1; }
-            paintSlider("CamTilt", camTiltValue);
-            send("CamTilt", camTiltValue);
-        }, SWEEP_DELAY);
-    }
-    function stopAutoSweep() {
-        if (sweepInterval) { clearInterval(sweepInterval); sweepInterval = null; }
-    }
-
     /* ── Mode ── */
     window.setMode = function (mode, silent) {
         if (!silent && mode === currentMode) return;
@@ -1348,21 +1325,18 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             if (r1 && r1.checked) { r1.checked = false; send("Relay", "0"); }
             if (r2 && r2.checked) { r2.checked = false; send("Relay2", "0"); }
             refreshRelayUI();
-            send("AMRelay", "1");
-            startAutoSweep();
+            send("AMRelay", "1"); // Turns ON Relay 17 for Auto Mode
 
             if (!silent) {
                 var cannonPart = cannonsWereOn ? "cannons off \u00B7 " : "";
-                var msg = "Auto mode \u00B7 " + cannonPart + "camera sweep active" + connSuffix;
+                var msg = "Automatic Mode \u00B7 " + cannonPart + "Relay 17 ON" + connSuffix;
                 notify(msg, "gold", { key: "mode" });
             }
         } else {
-            stopAutoSweep();
-            send("AMRelay", "0");
+            send("AMRelay", "0"); // Turns OFF Relay 17 for Manual Mode
 
             if (!silent) {
-                var sweepPart = previous === "auto" ? " \u00B7 camera sweep off" : "";
-                var msg = "Manual mode" + sweepPart + connSuffix;
+                var msg = "Manual Mode \u00B7 Relay 17 OFF" + connSuffix;
                 notify(msg, "gold", { key: "mode" });
             }
         }
