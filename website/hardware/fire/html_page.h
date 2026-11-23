@@ -853,15 +853,15 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
 
     </div>
 
-    <!-- Fire Suppression & Actuation Switches -->
+    <!-- Fire Suppression Switches -->
     <div class="bottom-section">
         <div class="control-group switches-container" id="relayControl">
-            <div class="section-title">Suppression & Actuation Systems</div>
+            <div class="section-title">Suppression Systems</div>
 
-            <!-- Water Cannon Relay -->
+            <!-- Water Cannon (Relay GPIO 16) -->
             <div class="control-row" id="waterRow">
                 <div class="control-label">
-                    💧 Water Cannon Relay
+                    💧 Water Cannon
                 </div>
                 <div class="control-widget">
                     <label class="switch water-switch">
@@ -872,33 +872,19 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
                 <div class="value-display" id="RelayStatus">OFF</div>
             </div>
 
-            <!-- Auto Mode Relay (Physical Relay on Pin 15 / 17) -->
-            <div class="control-row" id="autoRelayRow">
+            <!-- Sonic Wave Cannon (Direct TP3110 Amplifier on GPIO 26, NO RELAY) -->
+            <div class="control-row" id="sonicRow">
                 <div class="control-label">
-                    ⚡ Auto Mode Relay
-                </div>
-                <div class="control-widget">
-                    <label class="switch auto-switch">
-                        <input type="checkbox" id="AMRelay" aria-label="Auto Mode Relay">
-                        <span class="slider-toggle"></span>
-                    </label>
-                </div>
-                <div class="value-display" id="AMRelayStatus">OFF</div>
-            </div>
-
-            <!-- TP3110 Acoustic Cannon (Direct ESP32 DAC2 GPIO 26, No Relay) -->
-            <div class="control-row" id="ampRow">
-                <div class="control-label">
-                    🔊 TP3110 Acoustic Cannon
-                    <span style="display:block;font-size:10px;color:var(--text-mid);letter-spacing:0.5px;font-family:'DM Mono',monospace;">Direct ESP32 DAC2 · Extinguish Flame</span>
+                    🔊 Sonic Wave Cannon
+                    <span style="display:block;font-size:10px;color:var(--text-mid);letter-spacing:0.5px;font-family:'DM Mono',monospace;">TP3110 Amp · Direct GPIO 26 (No Relay) · Extinguish Flame</span>
                 </div>
                 <div class="control-widget">
                     <label class="switch sonic-switch">
-                        <input type="checkbox" id="Amp" aria-label="TP3110 Acoustic Cannon">
+                        <input type="checkbox" id="Relay2" aria-label="Sonic wave cannon">
                         <span class="slider-toggle"></span>
                     </label>
                 </div>
-                <div class="value-display" id="AmpStatus">OFF</div>
+                <div class="value-display" id="Relay2Status">OFF</div>
             </div>
         </div>
     </div>
@@ -1104,19 +1090,17 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
                 if (el) send(id, el.value);
             });
             send("Relay", "0");
-            send("AMRelay", currentMode === "auto" ? "1" : "0");
-            send("Amp", "0");
             send("Relay2", "0");
+            send("AMRelay", currentMode === "auto" ? "1" : "0");
         };
         ws.onclose = function () {
             var wasMoving = !!currentDirection;
             isConnected = false;
             setStatus("Disconnected - reconnecting...", false);
             stopMovementLocal();
-            var w = $("Relay"), a = $("AMRelay"), m = $("Amp");
+            var w = $("Relay"), s = $("Relay2");
             if (w) w.checked = false;
-            if (a) a.checked = false;
-            if (m) m.checked = false;
+            if (s) s.checked = false;
             refreshRelayUI();
 
             // Disconnects: stays in the bar in red until connection returns
@@ -1261,24 +1245,21 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
         }
     }
 
-    /* ── Relays & TP3110 Amplifier ── */
+    /* ── Relays & TP3110 Sonic Wave Cannon ── */
     function refreshRelayUI() {
-        var water = $("Relay"), autoR = $("AMRelay"), amp = $("Amp");
+        var water = $("Relay"), sonic = $("Relay2");
         var w = water ? water.checked : false;
-        var a = autoR ? autoR.checked : false;
-        var m = amp ? amp.checked : false;
+        var s = sonic ? sonic.checked : false;
 
         var rs = $("RelayStatus"); if (rs) rs.textContent  = w ? "ON" : "OFF";
-        var as = $("AMRelayStatus"); if (as) as.textContent = a ? "ON" : "OFF";
-        var ms = $("AmpStatus"); if (ms) ms.textContent   = m ? "ON" : "OFF";
+        var r2s = $("Relay2Status"); if (r2s) r2s.textContent = s ? "ON" : "OFF";
 
         var wr = $("waterRow"); if (wr) wr.classList.toggle("water-on", w);
-        var ar = $("autoRelayRow"); if (ar) ar.classList.toggle("auto-on", a);
-        var mr = $("ampRow"); if (mr) mr.classList.toggle("sonic-on", m);
+        var sr = $("sonicRow"); if (sr) sr.classList.toggle("sonic-on", s);
         var rc = $("relayControl");
         if (rc) {
             rc.classList.toggle("firing-water", w);
-            rc.classList.toggle("firing-sonic", m);
+            rc.classList.toggle("firing-sonic", s);
         }
     }
 
@@ -1290,37 +1271,20 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
         }
         send("Relay", state ? "1" : "0");
         refreshRelayUI();
-        notify(state ? "Water Cannon ON" : "Water Cannon OFF", state ? "water" : "gold",
+        notify(state ? "Water Cannon ON (Relay 16)" : "Water Cannon OFF", state ? "water" : "gold",
                { key: "water", ttl: state ? 3000 : 2000 });
     }
 
-    function handleAutoRelay(state) {
-        if (state && !requireConn("Not connected - Auto Mode Relay not changed")) {
-            var autoR = $("AMRelay"); if (autoR) autoR.checked = false;
-            refreshRelayUI();
-            return;
-        }
-        send("AMRelay", state ? "1" : "0");
-        refreshRelayUI();
-        notify(state ? "Auto Mode Relay ON" : "Auto Mode Relay OFF", state ? "gold" : "gold",
-               { key: "autorelay", ttl: state ? 3000 : 2000 });
-    }
-
-    function handleAmp(state) {
-        if (state && !requireConn("Not connected - TP3110 Acoustic Cannon not started")) {
-            var amp = $("Amp"); if (amp) amp.checked = false;
-            refreshRelayUI();
-            return;
-        }
-        send("Amp", state ? "1" : "0");
-        send("Relay2", state ? "1" : "0"); // Backward-compatibility
-        refreshRelayUI();
-        notify(state ? "TP3110 Acoustic Extinguisher ACTIVE" : "TP3110 Acoustic Standby", state ? "sonic" : "gold",
-               { key: "amp", ttl: state ? 3000 : 2000 });
-    }
-
     function handleSonic(state) {
-        handleAmp(state);
+        if (state && !requireConn("Not connected - Sonic Wave Cannon not started")) {
+            var sonic = $("Relay2"); if (sonic) sonic.checked = false;
+            refreshRelayUI();
+            return;
+        }
+        send("Relay2", state ? "1" : "0");
+        refreshRelayUI();
+        notify(state ? "TP3110 Sonic Wave ACTIVE (GPIO 26 DAC2)" : "TP3110 Sonic Wave OFF", state ? "sonic" : "gold",
+               { key: "sonic", ttl: state ? 3000 : 2000 });
     }
 
     function bindLockedNotice() {
@@ -1448,23 +1412,15 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
     window.stopMovement = stopMovement;
     window.stopCar = stopCar;
     window.handleWater = handleWater;
-    window.handleAutoRelay = handleAutoRelay;
-    window.handleAmp = handleAmp;
-    window.handleSonic = handleAmp;
-    window.handleGas = handleAmp;
+    window.handleSonic = handleSonic;
     window.toggleWater = function () {
         var el = $("Relay");
         if (el) { el.checked = !el.checked; handleWater(el.checked); }
     };
-    window.toggleAutoRelay = function () {
-        var el = $("AMRelay");
-        if (el) { el.checked = !el.checked; handleAutoRelay(el.checked); }
+    window.toggleSonic = function () {
+        var el = $("Relay2");
+        if (el) { el.checked = !el.checked; handleSonic(el.checked); }
     };
-    window.toggleAmp = function () {
-        var el = $("Amp");
-        if (el) { el.checked = !el.checked; handleAmp(el.checked); }
-    };
-    window.toggleSonic = window.toggleAmp;
     window.updateSliderValue = function (id, val) {
         paintSlider(id, val);
         send(id, val);
@@ -1496,10 +1452,9 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             });
         });
         bindDpad();
-        var r1 = $("Relay"), r2 = $("AMRelay"), r3 = $("Amp");
+        var r1 = $("Relay"), r2 = $("Relay2");
         if (r1) r1.addEventListener("change", function () { handleWater(this.checked); });
-        if (r2) r2.addEventListener("change", function () { handleAutoRelay(this.checked); });
-        if (r3) r3.addEventListener("change", function () { handleAmp(this.checked); });
+        if (r2) r2.addEventListener("change", function () { handleSonic(this.checked); });
         refreshRelayUI();
 
         var notifBar = $("notifBar");

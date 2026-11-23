@@ -59,10 +59,11 @@ Servo ultrasonicServo;
 #define OLED_SCL_PIN 22
 
 // ── Lighting & Relays ──
-#define LIGHT_PIN 4
-#define RELAY2_PIN 17    // Sonic Wave Suppressor Relay (formerly Gas/CO2)
-#define RELAY_PIN 16     // Water Relay (moved from 32 to avoid conflict with Pan Servo)
-#define AM_RELAY_PIN 15  // Auto Mode Relay (moved from 33 to avoid conflict with Tilt Servo)
+#define LIGHT_PIN       4
+#define AUTO_RELAY_PIN  17  // Auto Mode Relay (GPIO 17) -> Engaged ONLY when Automatic Mode is clicked
+#define RELAY_PIN       16  // Water Relay (GPIO 16)
+#define AM_RELAY_PIN    15  // Secondary Auto Relay Pin (GPIO 15)
+#define RELAY2_PIN      17  // Backwards compatibility alias for Auto Mode Relay GPIO 17
 
 #define UP 1
 #define DOWN 2
@@ -522,24 +523,30 @@ void onCarInputWebSocketEvent(AsyncWebSocket *server,
           camTiltServo.write(valueInt);
           Serial.printf("CamTilt servo set to: %d\n", valueInt);
         }
-        else if (key == "Amp" || key == "Relay2")
+        else if (key == "Relay2" || key == "Sonic" || key == "Amp")
         {
-          // Direct ESP32 DAC2 Acoustic Extinguisher Cannon (TP3110 Power Amp, NO RELAY)
+          // Direct ESP32 DAC2 Acoustic Extinguisher Cannon (TP3110 Power Amp on GPIO 26, NO RELAY!)
           sonicWaveActive = (valueInt == 1);
-          Serial.printf("TP3110 Acoustic Cannon: %s (Direct ESP32 DAC2 GPIO 26 -> TP3110, No Relay)\n", 
-                        sonicWaveActive ? "ACTIVE [FIRE EXTINCTION SOUND ON]" : "STANDBY [SILENT]");
+          Serial.printf("Sonic Wave Cannon: %s (Direct ESP32 DAC2 GPIO 26 -> TP3110 Amp, NO RELAY)\n", 
+                        sonicWaveActive ? "ACTIVE [45Hz/90Hz FIRE EXTINCTION SOUND ON]" : "STANDBY [SILENT]");
         }
         else if (key == "Relay")
         {
           digitalWrite(RELAY_PIN, valueInt == 1 ? HIGH : LOW);
-          Serial.printf("Water Cannon Relay (Pin %d): %s\n", RELAY_PIN, valueInt == 1 ? "ON" : "OFF");
+          Serial.printf("Water Cannon Relay (GPIO %d): %s\n", RELAY_PIN, valueInt == 1 ? "HIGH (ON)" : "LOW (OFF)");
         }
         else if (key == "AMRelay")
         {
-          // Auto Mode Relay - Drive both Pin 15 and Pin 17 for physical board compatibility
-          digitalWrite(AM_RELAY_PIN, valueInt == 1 ? HIGH : LOW);
-          digitalWrite(RELAY2_PIN, valueInt == 1 ? HIGH : LOW);
-          Serial.printf("Auto Mode Relay (Pins %d & %d): %s\n", AM_RELAY_PIN, RELAY2_PIN, valueInt == 1 ? "ON" : "OFF");
+          // Mode Selector at top of webpage:
+          // Clicking Automatic Mode -> Turns ON Relay 17!
+          // Clicking Manual Mode    -> Turns OFF Relay 17!
+          bool isAuto = (valueInt == 1);
+          digitalWrite(AUTO_RELAY_PIN, isAuto ? HIGH : LOW);
+          digitalWrite(AM_RELAY_PIN,   isAuto ? HIGH : LOW);
+          Serial.printf("Mode Switch: %s -> Relay 17 (GPIO %d) set to %s\n", 
+                        isAuto ? "AUTOMATIC MODE" : "MANUAL MODE", 
+                        AUTO_RELAY_PIN, 
+                        isAuto ? "HIGH (RELAY 17 ON)" : "LOW (RELAY 17 OFF)");
         }              
       }
       break;
@@ -607,15 +614,15 @@ void setUpPinModes()
   // Setup relay pins
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
-  Serial.printf("Water Relay pin %d initialized\n", RELAY_PIN);
- 
+  Serial.printf("Water Relay pin %d initialized (LOW/OFF)\n", RELAY_PIN);
+
+  pinMode(AUTO_RELAY_PIN, OUTPUT);
+  digitalWrite(AUTO_RELAY_PIN, LOW);
+  Serial.printf("Auto Mode Relay pin %d initialized (LOW/OFF)\n", AUTO_RELAY_PIN);
+
   pinMode(AM_RELAY_PIN, OUTPUT);
   digitalWrite(AM_RELAY_PIN, LOW);
-  Serial.printf("AM Relay pin %d initialized\n", AM_RELAY_PIN);
-
-  pinMode(RELAY2_PIN, OUTPUT);
-  digitalWrite(RELAY2_PIN, LOW);
-  Serial.printf("RELAY2 (Sonic Wave) pin %d initialized\n", RELAY2_PIN);
+  Serial.printf("Secondary Auto Mode Relay pin %d initialized (LOW/OFF)\n", AM_RELAY_PIN);
 
   // Setup NeoPixel pin
   pinMode(NEOPIXEL_PIN, OUTPUT);
