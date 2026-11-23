@@ -1,0 +1,1191 @@
+// ============================================================
+//   FIRE GUARD ROBOT - Autonomous ESP32 Suppression Rover
+//   Version: v4.5 (Enhanced Production Release)
+//
+//   Hardware Features:
+//     - 5-Channel IR Photodiode Flame Array (GPIO 33, 32, 35, 34, 39)
+//     - Neo-6M GPS Receiver via HardwareSerial2 (RX 16, TX 17)
+//     - High-Torque Extinguisher Vectoring Servo (GPIO 13)
+//     - 12V Submersible Water Pump Relay Driver (GPIO 19)
+//     - Piezo Warble Siren Alarm (GPIO 12, LEDC CH 0)
+//     - Dual HC-SR04 Ultrasonic Sonar Profiler (FL: 25/26, FR: 27/14)
+//     - 1.3" SH1106 I2C OLED Display (0x3C, SDA 21, SCL 22)
+//     - Cloud Logging to Supabase REST Endpoint (HTTPS)
+//     - FreeRTOS Multithreaded Architecture (Core 0 & Core 1)
+// ============================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <ESP32Servo.h>
+#include <TinyGPS++.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+// ============================================================
+//   OLED DISPLAY CONFIGURATION (128x64 SH1106 I2C)
+// ============================================================
+#define SCREEN_W   128
+#define SCREEN_H   64
+#define OLED_RESET -1
+#define OLED_ADDR  0x3C
+Adafruit_SH1106G display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
+bool oledOK = false;
+
+// ============================================================
+//   PIEZO BUZZER ALARM (LEDC Core 2.x & 3.x Compatible)
+// ============================================================
+#define BUZZER_PIN 12
+#define BUZZER_CH  0
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define BUZZER_ATTACH(pin, freq, res) ledcAttach(pin, freq, res)
+  #define BUZZER_TONE(pin, ch, freq)    ledcWriteTone(pin, freq)
+#else
+  #define BUZZER_ATTACH(pin, freq, res) do { ledcSetup(BUZZER_CH, freq, res); ledcAttachPin(pin, BUZZER_CH); } while(0)
+  #define BUZZER_TONE(pin, ch, freq)    ledcWriteTone(ch, freq)
+#endif
+
+// ============================================================
+//   WATER PUMP RELAY ACTUATOR
+//   Set RELAY_ACTIVE_LOW to true if using standard Active-LOW relay module
+// ============================================================
+#define RELAY_PIN 19
+#define RELAY_ACTIVE_LOW false
+volatile bool relayOn = false;
+
+// ============================================================
+//   NOZZLE SERVO ACTUATOR (GPIO 13)
+// ============================================================
+#define SERVO_PIN        13
+#define SERVO_STANDBY    90
+Servo fireServo;
+volatile int servoAngle = SERVO_STANDBY;
+const int SENSOR_SERVO_ANGLE[5] = { 45, 90, 135, 0, 180 };
+
+// ============================================================
+//   GPS MODULE — NEO-6M on HardwareSerial(2) (RX=16, TX=17)
+// ============================================================
+#define GPS_RX_PIN   16
+#define GPS_TX_PIN   17
+#define GPS_BAUD     9600
+HardwareSerial gpsSerial(2);
+TinyGPSPlus    gps;
+
+struct GpsData {
+  double  lat;
+  double  lng;
+  bool    valid;
+  uint8_t satellites;
+  double  hdop;
+};
+volatile GpsData gpsData = { 0.0, 0.0, false, 0, 99.9 };
+
+// ============================================================
+//   HC-SR04 ULTRASONIC RANGE SENSORS
+// ============================================================
+#define US_FL_CONNECTED true
+#define US_FR_CONNECTED false
+
+#define US_FL_TRIG  25
+#define US_FL_ECHO  26
+#define US_FR_TRIG  27
+#define US_FR_ECHO  14
+#define OBSTACLE_CM 30
+#define US_MAX_CM   400
+
+// ============================================================
+//   COMPONENT HEALTH & WATCHDOG
+// ============================================================
+#define NO_SIGNAL_CYCLES 8
+int noSignalCountL = 0;
+int noSignalCountR = 0;
+volatile bool compErrorL = false;
+volatile bool compErrorR = false;
+
+// Priority timing intervals
+#define OBSTACLE_SHOW_AFTER_MS  3000
+#define OBSTACLE_HOLD_MS        2000
+
+// ============================================================
+//   WIFI & SUPABASE CLOUD ENDPOINTS (LIVE SYNCHRONIZATION)
+// ============================================================
+const char* WIFI_SSID         = "NOVA..";
+const char* WIFI_PASSWORD     = "Nova@7399..";
+
+// User Live Supabase Project & Anon API Key
+const char* SUPABASE_URL      = "https://awktiffbxwhwuhkmpfvu.supabase.co";
+const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF3a3RpZmZieHdod3Voa21wZnZ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTU0MDkxNjQsImV4cCI6MjExMDk4NTE2NH0.fwTtEMn1sJbNE48kc-1L87_aNn5J3jYIwCgEffY3Hjs";
+const char* SUPABASE_TABLE    = "/rest/v1/fire_events";
+
+// ============================================================
+//   5-CHANNEL IR FLAME PHOTODIODE MATRIX
+//   Index 0: GPIO 33 -> Front-Left   (45°)
+//   Index 1: GPIO 32 -> Front-Center (90°)
+//   Index 2: GPIO 35 -> Front-Right  (135°)
+//   Index 3: GPIO 34 -> Left Flank   (0°)
+//   Index 4: GPIO 39 -> Right Flank  (180°)
+// ============================================================
+#define NUM_SENSORS 5
+const int SENSOR_PINS[NUM_SENSORS]  = { 33, 32, 35, 34, 39 };
+const char* SENSOR_DIR[NUM_SENSORS] = {
+  "Front-Left", "Front-Center", "Front-Right", "Left", "Right"
+};
+int  sensorBaseline[NUM_SENSORS] = { 0 };
+int  FIRE_THRESHOLD = 500;
+bool invertedLogic  = false;
+const int CONFIRM_COUNT = 3;
+int  confirmCounter     = 0;
+
+// ============================================================
+//   SHARED DATA BUFFER (PROTECTED BY MUTEX)
+// ============================================================
+struct SensorData {
+  int  values[NUM_SENSORS];
+  int  strongestIndex;
+  int  intensity;
+  int  activeSensors;
+  bool fireConfirmed;
+  const char* fireDirection;
+  const char* status;
+  char timestamp[32];
+  int  distLeft;
+  int  distRight;
+  bool obstacleLeft;
+  bool obstacleRight;
+};
+SensorData sData;
+
+volatile bool wifiConnected = false;
+volatile int  wifiStrength  = 0;
+volatile bool ntpSynced     = false;
+
+// ============================================================
+//   DISPLAY SCREENS & ANIMATION STATE
+// ============================================================
+enum Screen { SCR_BOOT, SCR_NORMAL, SCR_FIRE, SCR_OBSTACLE, SCR_ERROR };
+volatile Screen currentScreen    = SCR_BOOT;
+volatile int    animTick         = 0;
+volatile int    bootPct          = 0;
+volatile char   bootMsg[32]      = "Initializing...";
+
+volatile unsigned long fireStartTime    = 0;
+volatile unsigned long obstacleShowTime = 0;
+volatile bool          inObstacleWindow = false;
+
+// ============================================================
+//   FREERTOS MUTEX HANDLERS
+// ============================================================
+SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t dispMutex;
+SemaphoreHandle_t gpsMutex;
+
+// ============================================================
+//   FORWARD DECLARATIONS
+// ============================================================
+void calibrateSensors();
+void connectWiFi();
+void syncNTP();
+void postToSupabase(const char* ts, int intensity, int active,
+                    int sIdx, const char* dir, int vals[],
+                    int distL, int distR, bool relay,
+                    double lat, double lng, bool gpsValid);
+void updateTimestamp();
+int  readUltrasonic(int trigPin, int echoPin);
+void buzzerTone(int freq, int durationMs);
+void buzzerStartup();
+void drawBoot(int pct, const char* msg);
+void drawNormal();
+void drawFire();
+void drawObstacleAlert();
+void drawComponentError();
+void drawProgressBar(int x, int y, int w, int h, int pct);
+void drawWiFiIcon(int x, int y);
+void drawCenteredText(const char* txt, int y, uint8_t sz = 1);
+void drawDashedBorder(int phase);
+void updateScreenPriority();
+void setRelay(bool on);
+void setServoToSensor(int sensorIdx);
+void setServoAngle(int angle);
+
+// ============================================================
+//   ACTUATOR CONTROLS
+// ============================================================
+void setRelay(bool on) {
+  bool pinState = RELAY_ACTIVE_LOW ? !on : on;
+  digitalWrite(RELAY_PIN, pinState ? HIGH : LOW);
+  relayOn = on;
+  Serial.print("[RELAY] GPIO 19 -> ");
+  Serial.println(on ? "ENGAGED (DISCHARGE)" : "RELEASED (STANDBY)");
+}
+
+void setServoAngle(int angle) {
+  angle = constrain(angle, 0, 180);
+  fireServo.write(angle);
+  servoAngle = angle;
+  Serial.print("[SERVO] GPIO 13 Slewed -> ");
+  Serial.print(angle);
+  Serial.println(" deg");
+}
+
+void setServoToSensor(int sensorIdx) {
+  if (sensorIdx < 0 || sensorIdx >= NUM_SENSORS) return;
+  int angle = SENSOR_SERVO_ANGLE[sensorIdx];
+  setServoAngle(angle);
+  Serial.print("[SERVO] Vector Locked on: ");
+  Serial.print(SENSOR_DIR[sensorIdx]);
+  Serial.print(" (Target Angle: ");
+  Serial.print(angle);
+  Serial.println(" deg)");
+}
+
+// ============================================================
+//   OLED SCREEN PRIORITY MANAGER
+// ============================================================
+void updateScreenPriority() {
+  bool fire  = sData.fireConfirmed;
+  bool obs   = sData.obstacleLeft || sData.obstacleRight;
+  bool anyUS = US_FL_CONNECTED || US_FR_CONNECTED;
+  bool err   = compErrorL || compErrorR;
+
+  if (!fire && !obs && err) { currentScreen = SCR_ERROR; return; }
+  if (!fire && !obs) { currentScreen = SCR_NORMAL; inObstacleWindow = false; return; }
+  if (fire && !obs)  { currentScreen = SCR_FIRE;   inObstacleWindow = false; return; }
+  if (!fire && obs && anyUS) { currentScreen = SCR_OBSTACLE; return; }
+
+  if (fire && obs && anyUS) {
+    unsigned long now = millis();
+    if (!inObstacleWindow) {
+      if (fireStartTime == 0) fireStartTime = now;
+      if (now - fireStartTime >= OBSTACLE_SHOW_AFTER_MS) {
+        inObstacleWindow = true;
+        obstacleShowTime = now;
+        currentScreen    = SCR_OBSTACLE;
+      } else {
+        currentScreen = SCR_FIRE;
+      }
+    } else {
+      if (now - obstacleShowTime >= OBSTACLE_HOLD_MS) {
+        inObstacleWindow = false;
+        fireStartTime    = millis();
+        currentScreen    = SCR_FIRE;
+      } else {
+        currentScreen = SCR_OBSTACLE;
+      }
+    }
+    return;
+  }
+  currentScreen = SCR_NORMAL;
+}
+
+// ============================================================
+//   ULTRASONIC TIMING MEASUREMENT (HC-SR04)
+// ============================================================
+int readUltrasonic(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long dur = pulseIn(echoPin, HIGH, 25000); // 25ms timeout (~4.3m max)
+  if (dur == 0) return US_MAX_CM;
+  return constrain((int)(dur / 58), 0, US_MAX_CM);
+}
+
+// ============================================================
+//   BUZZER SOUND SYNTHESIS
+// ============================================================
+void buzzerTone(int freq, int durationMs) {
+  BUZZER_TONE(BUZZER_PIN, BUZZER_CH, freq > 0 ? freq : 0);
+  vTaskDelay(pdMS_TO_TICKS(durationMs));
+}
+
+void buzzerStartup() {
+  BUZZER_ATTACH(BUZZER_PIN, 2000, 8);
+  buzzerTone(1000, 80); buzzerTone(0, 80);
+  buzzerTone(1400, 80); buzzerTone(0, 200);
+}
+
+// ============================================================
+//   NTP CLOCK SYNCHRONIZATION
+// ============================================================
+void syncNTP() {
+  Serial.println("[NTP] Querying NIST / NTP time servers...");
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // IST UTC+5:30
+  struct tm ti;
+  unsigned long t = millis();
+  while (!getLocalTime(&ti) && millis() - t < 8000) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  ntpSynced = (getLocalTime(&ti) && ti.tm_year > 70);
+  Serial.println(ntpSynced ? "[NTP] Time Synchronized (IST UTC+5:30)" : "[NTP] Sync Failed (Will use fallback timestamp)");
+}
+
+// ============================================================
+//   FREERTOS TASK 1: SENSOR ACQUISITION & VECTORING (Core 1, Pri 5)
+// ============================================================
+void taskSensors(void* param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  while (1) {
+    int dL = US_MAX_CM, dR = US_MAX_CM;
+    if (US_FL_CONNECTED) dL = readUltrasonic(US_FL_TRIG, US_FL_ECHO);
+    if (US_FR_CONNECTED) dR = readUltrasonic(US_FR_TRIG, US_FR_ECHO);
+
+    if (US_FL_CONNECTED) {
+      noSignalCountL = (dL >= US_MAX_CM) ? noSignalCountL + 1 : 0;
+      compErrorL = (noSignalCountL >= NO_SIGNAL_CYCLES);
+    }
+    if (US_FR_CONNECTED) {
+      noSignalCountR = (dR >= US_MAX_CM) ? noSignalCountR + 1 : 0;
+      compErrorR = (noSignalCountR >= NO_SIGNAL_CYCLES);
+    }
+
+    bool fireThisCycle = false;
+    int  strongest = 0, strongestIdx = -1, activeCount = 0, peakInt = 0;
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      if (US_FL_CONNECTED) {
+        sData.distLeft     = dL;
+        sData.obstacleLeft = (!compErrorL && dL <= OBSTACLE_CM);
+      } else { sData.distLeft = -1; sData.obstacleLeft = false; }
+
+      if (US_FR_CONNECTED) {
+        sData.distRight     = dR;
+        sData.obstacleRight = (!compErrorR && dR <= OBSTACLE_CM);
+      } else { sData.distRight = -1; sData.obstacleRight = false; }
+
+      // Read 5 ADC flame sensor channels
+      for (int i = 0; i < NUM_SENSORS; i++) {
+        int v = analogRead(SENSOR_PINS[i]);
+        sData.values[i] = v;
+        int dev = 0;
+        if (invertedLogic) {
+          dev = (v > sensorBaseline[i]) ? (v - sensorBaseline[i]) : 0;
+        } else {
+          dev = (sensorBaseline[i] > v) ? (sensorBaseline[i] - v) : 0;
+        }
+        if (dev > FIRE_THRESHOLD) {
+          activeCount++;
+          fireThisCycle = true;
+          if (dev > strongest) {
+            strongest = dev;
+            strongestIdx = i;
+            peakInt = min(100, (dev * 100) / max(1, sensorBaseline[i]));
+          }
+        }
+      }
+      sData.activeSensors = activeCount;
+
+      // Fire confirmation filter (Requires 3 consecutive cycles)
+      if (fireThisCycle && activeCount >= 1) {
+        confirmCounter++;
+        if (confirmCounter >= CONFIRM_COUNT) {
+          sData.intensity = peakInt;
+          if (!sData.fireConfirmed) {
+            sData.fireConfirmed  = true;
+            sData.strongestIndex = strongestIdx;
+            sData.fireDirection  = SENSOR_DIR[strongestIdx];
+            sData.status         = "Fire!";
+            fireStartTime        = millis();
+            setRelay(true);
+            setServoToSensor(strongestIdx);
+            Serial.println("==================================================");
+            Serial.print("  [HAZARD LOCK] CONFIRMED FIRE: Sector ");
+            Serial.print(sData.fireDirection);
+            Serial.print(" | Intensity: "); Serial.print(sData.intensity);
+            Serial.print("% | Servo: ");
+            Serial.print(SENSOR_SERVO_ANGLE[strongestIdx]);
+            Serial.println(" deg");
+            Serial.println("==================================================");
+          } else if (strongestIdx != sData.strongestIndex) {
+            sData.strongestIndex = strongestIdx;
+            sData.fireDirection  = SENSOR_DIR[strongestIdx];
+            setServoToSensor(strongestIdx);
+          }
+        }
+      } else {
+        confirmCounter  = 0;
+        sData.intensity = 0;
+        if (sData.fireConfirmed) {
+          sData.fireConfirmed = false;
+          sData.activeSensors = 0;
+          sData.status        = "Clear";
+          fireStartTime       = 0;
+          inObstacleWindow    = false;
+          setRelay(false);
+          setServoAngle(SERVO_STANDBY);
+          Serial.println("[FIRE RESOLVED] All vectors clear. Extinguisher pump OFF, Servo 90 deg.");
+        }
+      }
+
+      if (sData.obstacleLeft || sData.obstacleRight) {
+        Serial.print("[OBSTACLE HAZARD]");
+        if (US_FL_CONNECTED && !compErrorL) { Serial.print(" L="); Serial.print(dL); Serial.print("cm"); }
+        if (US_FR_CONNECTED && !compErrorR) { Serial.print(" R="); Serial.print(dR); Serial.print("cm"); }
+        Serial.println(" -> ROVER BRAKE INTERLOCK");
+      }
+
+      updateScreenPriority();
+      xSemaphoreGive(dataMutex);
+    }
+
+    // Status heartbeat print every 5 seconds
+    static unsigned long lastPrint = 0;
+    static bool lastFire = false;
+    if (sData.fireConfirmed != lastFire || millis() - lastPrint >= 5000) {
+      lastPrint = millis();
+      lastFire = sData.fireConfirmed;
+      if (!sData.fireConfirmed) {
+        Serial.print("[ADC MATRIX] ");
+        for (int i = 0; i < NUM_SENSORS; i++) {
+          Serial.print("S"); Serial.print(i);
+          Serial.print(":"); Serial.print(sData.values[i]); Serial.print(" ");
+        }
+        if (US_FL_CONNECTED) {
+          Serial.print("| Sonar L=");
+          if (compErrorL) Serial.print("ERR");
+          else { Serial.print(dL); Serial.print("cm"); }
+          Serial.print(" ");
+        }
+        Serial.print("| Servo="); Serial.print(servoAngle); Serial.println("deg");
+      }
+    }
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(100));
+  }
+}
+
+// ============================================================
+//   FREERTOS TASK 2: SH1106 OLED DISPLAY (Core 0, Priority 3)
+// ============================================================
+void taskDisplay(void* param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  while (1) {
+    animTick++;
+    if (oledOK && xSemaphoreTake(dispMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      display.clearDisplay();
+      switch (currentScreen) {
+        case SCR_BOOT:     drawBoot(bootPct, (const char*)bootMsg); break;
+        case SCR_NORMAL:   drawNormal();        break;
+        case SCR_FIRE:     drawFire();           break;
+        case SCR_OBSTACLE: drawObstacleAlert();  break;
+        case SCR_ERROR:    drawComponentError(); break;
+      }
+      display.display();
+      xSemaphoreGive(dispMutex);
+    }
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(100));
+  }
+}
+
+// ============================================================
+//   FREERTOS TASK 3: WIFI & SUPABASE DISPATCH (Core 0, Priority 1)
+// ============================================================
+void taskWiFi(void* param) {
+  connectWiFi();
+  if (wifiConnected) syncNTP();
+
+  TickType_t lastPost  = xTaskGetTickCount();
+  TickType_t lastCheck = xTaskGetTickCount();
+
+  while (1) {
+    TickType_t now = xTaskGetTickCount();
+
+    // WiFi Watchdog Check every 10 seconds
+    if (now - lastCheck >= pdMS_TO_TICKS(10000)) {
+      lastCheck = now;
+      if (WiFi.status() != WL_CONNECTED) {
+        wifiConnected = false;
+        wifiStrength  = 0;
+        ntpSynced     = false;
+        WiFi.reconnect();
+      } else {
+        wifiConnected = true;
+        int r = WiFi.RSSI();
+        wifiStrength = (r > -55) ? 4 : (r > -65) ? 3 :
+                       (r > -75) ? 2 : (r > -85) ? 1 : 0;
+        if (!ntpSynced) syncNTP();
+      }
+    }
+
+    bool fireNow = false, relayNow = false;
+    int  intensity = 0, active = 0, sIdx = -1, distL = -1, distR = -1;
+    char dir[20] = "None", ts[32] = "";
+    int  vals[NUM_SENSORS] = { 0 };
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      fireNow   = sData.fireConfirmed;
+      relayNow  = relayOn;
+      intensity = sData.intensity;
+      active    = sData.activeSensors;
+      sIdx      = sData.strongestIndex;
+      distL     = sData.distLeft;
+      distR     = sData.distRight;
+      strncpy(dir, sData.fireDirection, 19);
+      updateTimestamp();
+      strncpy(ts, sData.timestamp, 31);
+      for (int i = 0; i < NUM_SENSORS; i++) vals[i] = sData.values[i];
+      xSemaphoreGive(dataMutex);
+    }
+
+    // Grab latest Neo-6M GPS Fix
+    double lat = 0.0, lng = 0.0;
+    bool   gpsValid = false;
+    if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      lat      = gpsData.lat;
+      lng      = gpsData.lng;
+      gpsValid = gpsData.valid;
+      xSemaphoreGive(gpsMutex);
+    }
+
+    // Rate-limited Cloud Logging to Supabase (Every 3 seconds during fire suppression)
+    if (fireNow && wifiConnected && now - lastPost >= pdMS_TO_TICKS(3000)) {
+      lastPost = now;
+      postToSupabase(ts, intensity, active, sIdx, dir, vals,
+                     distL, distR, relayNow, lat, lng, gpsValid);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ============================================================
+//   FREERTOS TASK 4: PIEZO SIREN WARBLE (Core 1, Priority 2)
+// ============================================================
+void taskBuzzer(void* param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  while (1) {
+    bool fire = false, obstacle = false, err = false;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      fire     = sData.fireConfirmed;
+      obstacle = sData.obstacleLeft || sData.obstacleRight;
+      err      = compErrorL || compErrorR;
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (fire) {
+      // High-low alternating tactical emergency siren
+      ledcWriteTone(BUZZER_CH, 900);  vTaskDelay(pdMS_TO_TICKS(180));
+      ledcWriteTone(BUZZER_CH, 0);    vTaskDelay(pdMS_TO_TICKS(80));
+      ledcWriteTone(BUZZER_CH, 1400); vTaskDelay(pdMS_TO_TICKS(180));
+      ledcWriteTone(BUZZER_CH, 0);    vTaskDelay(pdMS_TO_TICKS(80));
+      ledcWriteTone(BUZZER_CH, 900);  vTaskDelay(pdMS_TO_TICKS(180));
+      ledcWriteTone(BUZZER_CH, 0);    vTaskDelay(pdMS_TO_TICKS(80));
+      ledcWriteTone(BUZZER_CH, 1400); vTaskDelay(pdMS_TO_TICKS(180));
+      ledcWriteTone(BUZZER_CH, 0);
+      if (obstacle) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ledcWriteTone(BUZZER_CH, 2500); vTaskDelay(pdMS_TO_TICKS(60));
+        ledcWriteTone(BUZZER_CH, 0);    vTaskDelay(pdMS_TO_TICKS(340));
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(600));
+      }
+    } else if (obstacle) {
+      // Rapid obstacle warning chirp
+      ledcWriteTone(BUZZER_CH, 2000); vTaskDelay(pdMS_TO_TICKS(100));
+      ledcWriteTone(BUZZER_CH, 0);    vTaskDelay(pdMS_TO_TICKS(100));
+      ledcWriteTone(BUZZER_CH, 2000); vTaskDelay(pdMS_TO_TICKS(100));
+      ledcWriteTone(BUZZER_CH, 0);    vTaskDelay(pdMS_TO_TICKS(400));
+    } else if (err) {
+      // Low fault warning chirp
+      ledcWriteTone(BUZZER_CH, 600); vTaskDelay(pdMS_TO_TICKS(100));
+      ledcWriteTone(BUZZER_CH, 0);   vTaskDelay(pdMS_TO_TICKS(100));
+      ledcWriteTone(BUZZER_CH, 600); vTaskDelay(pdMS_TO_TICKS(100));
+      ledcWriteTone(BUZZER_CH, 0);   vTaskDelay(pdMS_TO_TICKS(3000));
+    } else {
+      ledcWriteTone(BUZZER_CH, 0);
+      vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(200));
+    }
+  }
+}
+
+// ============================================================
+//   FREERTOS TASK 5: NEO-6M GPS STREAM PARSER (Core 0, Priority 2)
+// ============================================================
+void taskGPS(void* param) {
+  TickType_t lastWake = xTaskGetTickCount();
+  static unsigned long lastLog = 0;
+
+  while (1) {
+    while (gpsSerial.available() > 0) {
+      gps.encode(gpsSerial.read());
+    }
+
+    if (gps.location.isValid() && gps.location.age() < 2500) {
+      if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        gpsData.lat   = gps.location.lat();
+        gpsData.lng   = gps.location.lng();
+        gpsData.valid = true;
+        if (gps.satellites.isValid()) gpsData.satellites = (uint8_t)gps.satellites.value();
+        if (gps.hdop.isValid())       gpsData.hdop       = gps.hdop.hdop();
+        xSemaphoreGive(gpsMutex);
+      }
+    }
+
+    if (millis() - lastLog >= 10000) {
+      lastLog = millis();
+      if (gpsData.valid) {
+        Serial.print("[GPS FIX] Lat: "); Serial.print(gpsData.lat, 6);
+        Serial.print(" | Lng: ");        Serial.print(gpsData.lng, 6);
+        Serial.print(" | Sats: ");       Serial.print(gpsData.satellites);
+        Serial.print(" | HDOP: ");       Serial.println(gpsData.hdop, 1);
+      } else {
+        Serial.print("[GPS] Acquiring Fix... (NMEA Bytes: ");
+        Serial.print(gps.charsProcessed());
+        Serial.print(", Sentences: ");
+        Serial.print(gps.sentencesWithFix());
+        Serial.println(")");
+      }
+    }
+
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(50));
+  }
+}
+
+// ============================================================
+//   MAIN HARDWARE SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n==================================================");
+  Serial.println("   FIRE GUARD ROBOT v4.5 - Boot Sequence Active");
+  Serial.println("==================================================");
+
+  // Initialize Water Pump Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  relayOn = false;
+  Serial.println("[INIT] Water Pump Relay -> GPIO 19 Initialized (LOW)");
+
+  // Initialize Extinguisher Nozzle Servo
+  ESP32PWM::allocateTimer(1);
+  fireServo.setPeriodHertz(50);
+  fireServo.attach(SERVO_PIN, 500, 2400);
+  fireServo.write(SERVO_STANDBY);
+  servoAngle = SERVO_STANDBY;
+  Serial.println("[INIT] Extinguisher Servo -> GPIO 13 Initialized (Center 90 deg)");
+
+  // Initialize Neo-6M GPS on Serial2
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("[INIT] Neo-6M GPS -> HardwareSerial2 (RX: 16, TX: 17, 9600 Baud)");
+
+  // Mutex Allocation
+  dataMutex = xSemaphoreCreateMutex();
+  dispMutex = xSemaphoreCreateMutex();
+  gpsMutex  = xSemaphoreCreateMutex();
+
+  sData.fireConfirmed  = false;
+  sData.intensity      = 0;
+  sData.activeSensors  = 0;
+  sData.status         = "Clear";
+  sData.fireDirection  = "None";
+  sData.strongestIndex = -1;
+  sData.distLeft       = US_FL_CONNECTED ? US_MAX_CM : -1;
+  sData.distRight      = US_FR_CONNECTED ? US_MAX_CM : -1;
+  sData.obstacleLeft   = false;
+  sData.obstacleRight  = false;
+
+  // Initialize I2C OLED
+  Wire.begin();
+  Wire.setClock(400000);
+  if (display.begin(OLED_ADDR, true)) {
+    oledOK = true;
+    display.clearDisplay();
+    display.setTextColor(SH110X_WHITE);
+    display.display();
+    Serial.println("[INIT] Adafruit SH1106 OLED -> Initialized (0x3C)");
+  } else {
+    Serial.println("[WARN] OLED Display Not Detected at 0x3C");
+  }
+
+  // Ultrasonic Pin Configuration
+  if (US_FL_CONNECTED) {
+    pinMode(US_FL_TRIG, OUTPUT); pinMode(US_FL_ECHO, INPUT);
+    digitalWrite(US_FL_TRIG, LOW);
+  }
+  if (US_FR_CONNECTED) {
+    pinMode(US_FR_TRIG, OUTPUT); pinMode(US_FR_ECHO, INPUT);
+    digitalWrite(US_FR_TRIG, LOW);
+  }
+
+  auto boot = [](int pct, const char* msg) {
+    bootPct = pct;
+    strncpy((char*)bootMsg, msg, 31);
+    Serial.print("[BOOT] "); Serial.print(pct); Serial.print("% - "); Serial.println(msg);
+    if (oledOK) {
+      display.clearDisplay();
+      drawBoot(pct, msg);
+      display.display();
+    }
+  };
+
+  boot(10, "Display ready");
+  for (int i = 0; i < NUM_SENSORS; i++) pinMode(SENSOR_PINS[i], INPUT);
+  boot(20, "Sensors configured");
+  boot(30, "Nozzle calibrated");
+  boot(40, "GPS serial ready");
+  boot(50, "Calibrating baseline...");
+  calibrateSensors();
+  boot(70, "Sensors tuned");
+  boot(80, "Connecting WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long wt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wt < 10000) {
+    delay(300);
+    boot(min(92, 80 + (int)((millis() - wt) / 300)), "Connecting WiFi...");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    int r = WiFi.RSSI();
+    wifiStrength = (r > -55) ? 4 : (r > -65) ? 3 :
+                   (r > -75) ? 2 : (r > -85) ? 1 : 0;
+    Serial.print("[WIFI] Connected! IP: "); Serial.print(WiFi.localIP());
+    Serial.print(" | RSSI: "); Serial.print(r); Serial.println(" dBm");
+    boot(96, "WiFi online!");
+  } else {
+    Serial.println("[WIFI] Standby - Background reconnect engaged");
+    boot(96, "WiFi standby...");
+  }
+
+  boot(100, "Ready for Mission!");
+  delay(400);
+  buzzerStartup();
+  currentScreen = SCR_NORMAL;
+
+  // Launch Core-Pinned FreeRTOS Tasks
+  xTaskCreatePinnedToCore(taskSensors, "Sensors", 4096, NULL, 5, NULL, 1);
+  xTaskCreatePinnedToCore(taskDisplay, "Display", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(taskWiFi,    "WiFi",    8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(taskBuzzer,  "Buzzer",  2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskGPS,     "GPS",     4096, NULL, 2, NULL, 0);
+  Serial.println("[FREERTOS] 5 Autonomous Tasks Running Across Core 0 and Core 1\n");
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+// ============================================================
+//   SENSOR BASELINE AUTO-CALIBRATION
+// ============================================================
+void calibrateSensors() {
+  long sums[NUM_SENSORS] = { 0 };
+  for (int r = 0; r < 12; r++) {
+    for (int i = 0; i < NUM_SENSORS; i++) sums[i] += analogRead(SENSOR_PINS[i]);
+    delay(25);
+  }
+  int total = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sensorBaseline[i] = sums[i] / 12;
+    total += sensorBaseline[i];
+    Serial.print("  [CALIBRATED] "); Serial.print(SENSOR_DIR[i]);
+    Serial.print(" (GPIO "); Serial.print(SENSOR_PINS[i]);
+    Serial.print(") Baseline = "); Serial.println(sensorBaseline[i]);
+  }
+  int avg = total / NUM_SENSORS;
+  // Ambient baseline: standard LM393 IR flame modules are pull-up (normally HIGH ~2000-4095; drops when IR flame detected)
+  // Only if baseline is near 0 (< 300) does voltage rise on flame
+  if (avg < 300) {
+    invertedLogic = true;
+    FIRE_THRESHOLD = 200;
+  } else {
+    invertedLogic = false; // Standard pull-up: voltage drops on flame detection
+    FIRE_THRESHOLD = 400;
+  }
+
+  Serial.print("  [CONFIG] Ambient Mean: "); Serial.print(avg);
+  Serial.print(" | Threshold Delta: "); Serial.print(FIRE_THRESHOLD);
+  Serial.print(" | Inverted Logic: "); Serial.println(invertedLogic ? "YES" : "NO");
+}
+
+// ============================================================
+//   TIMESTAMP COMPILER (NTP WITH UPTIME FALLBACK)
+// ============================================================
+void updateTimestamp() {
+  struct tm ti;
+  if (getLocalTime(&ti) && ti.tm_year > 70) {
+    strftime(sData.timestamp, sizeof(sData.timestamp), "%Y-%m-%dT%H:%M:%S+05:30", &ti);
+  } else {
+    // Robust ISO-8601 Fallback Timestamp
+    unsigned long sec = millis() / 1000;
+    snprintf(sData.timestamp, sizeof(sData.timestamp), "2026-01-01T%02lu:%02lu:%02luZ",
+             (sec / 3600) % 24, (sec / 60) % 60, sec % 60);
+  }
+}
+
+// ============================================================
+//   WIFI CONNECTION HANDLER
+// ============================================================
+void connectWiFi() {
+  Serial.print("[WIFI] Connecting to '");
+  Serial.print(WIFI_SSID);
+  Serial.print("'");
+
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
+    vTaskDelay(pdMS_TO_TICKS(400));
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    int r = WiFi.RSSI();
+    wifiStrength = (r > -55) ? 4 : (r > -65) ? 3 :
+                   (r > -75) ? 2 : (r > -85) ? 1 : 0;
+    Serial.println("\n[WIFI] Connected! IP: " + WiFi.localIP().toString());
+  } else {
+    wifiConnected = false;
+    wifiStrength  = 0;
+    Serial.println("\n[WIFI] Connect failed. Background reconnect standby.");
+  }
+}
+
+// ============================================================
+//   SUPABASE CLOUD REST POST DISPATCHER
+// ============================================================
+void postToSupabase(const char* ts, int intensity, int active,
+                    int sIdx, const char* dir, int vals[],
+                    int distL, int distR, bool relay,
+                    double lat, double lng, bool gpsValid) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[SUPABASE] Offline - Post aborted");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Bypass TLS root certificate validation for efficiency
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
+
+  String endpoint = String(SUPABASE_URL) + SUPABASE_TABLE;
+  if (!http.begin(client, endpoint)) {
+    Serial.println("[SUPABASE] Failed to initiate HTTP connection");
+    return;
+  }
+
+  http.addHeader("Content-Type",  "application/json");
+  http.addHeader("apikey",        SUPABASE_ANON_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
+  http.addHeader("Prefer",        "return=minimal");
+
+  char vs[60] = "";
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    char tmp[12];
+    snprintf(tmp, sizeof(tmp), i < NUM_SENSORS - 1 ? "%d," : "%d", vals[i]);
+    strcat(vs, tmp);
+  }
+
+  DynamicJsonDocument doc(1024);
+  doc["event_time"]          = ts;
+  doc["fire_status"]         = "Fire!";
+  doc["fire_intensity"]      = intensity;
+  doc["strongest_direction"] = dir;
+  doc["strongest_sensor_id"] = sIdx;
+  doc["active_sensor_count"] = active;
+  doc["sensor_values"]       = vs;
+  doc["relay_status"]        = relay ? "ON" : "OFF";
+
+  if (US_FL_CONNECTED && !compErrorL) doc["dist_left"]  = distL;
+  if (US_FR_CONNECTED && !compErrorR) doc["dist_right"] = distR;
+
+  // Include precise GPS fix coordinates
+  if (gpsValid) {
+    doc["latitude"]  = serialized(String(lat, 6));
+    doc["longitude"] = serialized(String(lng, 6));
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int httpCode = http.POST(payload);
+  if (httpCode == 200 || httpCode == 201) {
+    Serial.print("[SUPABASE SUCCESS] Fire Event Logged | Intensity: ");
+    Serial.print(intensity);
+    Serial.print("% | Direction: "); Serial.print(dir);
+    Serial.print(" | Relay: "); Serial.print(relay ? "ACTIVE" : "STANDBY");
+    if (gpsValid) {
+      Serial.print(" | GPS: "); Serial.print(lat, 5); Serial.print(", "); Serial.println(lng, 5);
+    } else {
+      Serial.println(" | GPS: No Fix");
+    }
+  } else {
+    Serial.print("[SUPABASE ERROR] HTTP Response Code: ");
+    Serial.println(httpCode);
+  }
+
+  http.end();
+}
+
+// ============================================================
+//   OLED GRAPHICS HELPERS
+// ============================================================
+void drawProgressBar(int x, int y, int w, int h, int pct) {
+  display.drawRect(x, y, w, h, SH110X_WHITE);
+  int fw = ((w - 2) * constrain(pct, 0, 100)) / 100;
+  if (fw > 0) display.fillRect(x + 1, y + 1, fw, h - 2, SH110X_WHITE);
+}
+
+void drawWiFiIcon(int x, int y) {
+  const int hh[4] = { 3, 5, 7, 9 };
+  for (int i = 0; i < 4; i++) {
+    int bx = x + i * 4, bh = hh[i], by = y + 9 - bh;
+    if (i < wifiStrength) display.fillRect(bx, by, 3, bh, SH110X_WHITE);
+    else                   display.drawRect(bx, by, 3, bh, SH110X_WHITE);
+  }
+}
+
+void drawCenteredText(const char* txt, int y, uint8_t sz) {
+  display.setTextSize(sz);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_W - w) / 2, y);
+  display.print(txt);
+}
+
+void drawDashedBorder(int phase) {
+  int off = phase % 4;
+  for (int x = off; x < SCREEN_W; x += 4) {
+    display.drawPixel(x, 0,          SH110X_WHITE);
+    display.drawPixel(x, SCREEN_H-1, SH110X_WHITE);
+  }
+  for (int y = off; y < SCREEN_H; y += 4) {
+    display.drawPixel(0,          y, SH110X_WHITE);
+    display.drawPixel(SCREEN_W-1, y, SH110X_WHITE);
+  }
+}
+
+// ============================================================
+//   SCREEN 1: BOOT SEQUENCE
+// ============================================================
+void drawBoot(int pct, const char* msg) {
+  display.fillRect(0, 0, SCREEN_W, 18, SH110X_WHITE);
+  display.setTextColor(SH110X_BLACK);
+  display.setTextSize(2);
+  display.setCursor(4, 2);
+  display.print("FIRE GUARD");
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  drawCenteredText("Phase 1  v4.5", 22);
+  display.drawLine(10, 30, 118, 30, SH110X_WHITE);
+  drawCenteredText(msg, 35);
+  drawProgressBar(8, 46, 112, 8, pct);
+  char ps[8]; snprintf(ps, sizeof(ps), "%d%%", pct);
+  drawCenteredText(ps, 57);
+}
+
+// ============================================================
+//   SCREEN 2: NORMAL PATROL HUD
+// ============================================================
+void drawNormal() {
+  display.fillRect(0, 0, SCREEN_W, 11, SH110X_WHITE);
+  display.setTextColor(SH110X_BLACK);
+  display.setTextSize(1);
+  display.setCursor(3, 2);
+  display.print("FIRE GUARD");
+  display.setTextColor(SH110X_WHITE);
+  drawWiFiIcon(110, 0);
+
+  display.setCursor(2, 14);
+  display.print("Status:");
+  display.setCursor(50, 14);
+  display.print(wifiConnected ? "WiFi OK" : "No WiFi");
+  display.drawLine(0, 23, SCREEN_W, 23, SH110X_WHITE);
+
+  display.setCursor(2, 26);
+  display.print("SEN:");
+  const char* sd[5] = { "FL", "FC", "FR", "L", "R" };
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int cx = 32 + i * 18;
+    bool fired = false;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
+      int v   = sData.values[i];
+      int dev = invertedLogic ? (v - sensorBaseline[i]) : (sensorBaseline[i] - v);
+      fired   = (dev > FIRE_THRESHOLD);
+      xSemaphoreGive(dataMutex);
+    }
+    if (fired) display.fillRect(cx - 3, 24, 8, 8, SH110X_WHITE);
+    else        display.drawRect(cx - 3, 24, 8, 8, SH110X_WHITE);
+    display.setCursor(28 + i * 18, 34);
+    display.print(sd[i]);
+  }
+  display.drawLine(0, 44, SCREEN_W, 44, SH110X_WHITE);
+
+  display.setCursor(2, 47);
+  display.print("Rly:"); display.print(relayOn ? "ON " : "OFF");
+  display.setCursor(60, 47);
+  display.print("Srv:"); display.print(servoAngle); display.print("d");
+
+  // GPS satellite fix status on bottom row
+  display.setCursor(2, 56);
+  if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
+    if (gpsData.valid) {
+      display.print("GPS:"); display.print((int)gpsData.satellites);
+      display.print("sat");
+    } else {
+      display.print("GPS:searching");
+    }
+    xSemaphoreGive(gpsMutex);
+  }
+}
+
+// ============================================================
+//   SCREEN 3: FIRE ALERT & SUPPRESSION HUD
+// ============================================================
+void drawFire() {
+  drawDashedBorder(animTick / 3);
+  bool blink = (animTick / 4) % 2 == 0;
+  if (blink) {
+    display.fillRect(2, 2, SCREEN_W - 4, 13, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    drawCenteredText("!! FIRE ALERT !!", 4);
+    display.setTextColor(SH110X_WHITE);
+  } else {
+    drawCenteredText("!! FIRE ALERT !!", 4);
+  }
+
+  int intensity = 0, active = 0;
+  const char* dir = "???";
+  bool obsActive = false;
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    intensity = sData.intensity;
+    active    = sData.activeSensors;
+    dir       = sData.fireDirection;
+    obsActive = sData.obstacleLeft || sData.obstacleRight;
+    xSemaphoreGive(dataMutex);
+  }
+
+  display.setTextSize(1);
+  display.setCursor(4, 19);
+  display.print("Dir:"); display.print(dir);
+
+  char sc[12]; snprintf(sc, sizeof(sc), "Sen:%d/5", active);
+  display.setCursor(4, 29); display.print(sc);
+  display.setCursor(70, 29);
+  display.print("Srv:"); display.print(servoAngle); display.print("d");
+
+  display.setCursor(4, 38);
+  display.print("Int:");
+  char ps[6]; snprintf(ps, sizeof(ps), "%d%%", intensity);
+  display.print(ps);
+  display.setCursor(70, 38);
+  display.print("Rly:"); display.print(relayOn ? "ON" : "OFF");
+
+  drawProgressBar(4, 46, 120, 6, intensity);
+
+  bool showObs = obsActive && (US_FL_CONNECTED || US_FR_CONNECTED) && ((animTick / 5) % 2 == 0);
+  display.fillRect(0, 55, SCREEN_W, 9, showObs ? SH110X_WHITE : SH110X_BLACK);
+  display.setTextColor(showObs ? SH110X_BLACK : SH110X_WHITE);
+  if (showObs) {
+    drawCenteredText("OBS-STOP CHECK PATH", 57);
+  } else {
+    display.setCursor(2, 57);
+    bool gv = false;
+    if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
+      gv = gpsData.valid;
+      xSemaphoreGive(gpsMutex);
+    }
+    display.print(gv ? "GPS:FIX " : "GPS:---- ");
+    display.print(wifiConnected ? "DB:ON" : "DB:OFF");
+  }
+  display.setTextColor(SH110X_WHITE);
+}
+
+// ============================================================
+//   SCREEN 4: OBSTACLE COLLISION WARNING HUD
+// ============================================================
+void drawObstacleAlert() {
+  drawDashedBorder(animTick / 3);
+  bool blink = (animTick / 4) % 2 == 0;
+  if (blink) {
+    display.fillRect(2, 2, SCREEN_W - 4, 13, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    drawCenteredText("!! OBSTACLE !!", 4);
+    display.setTextColor(SH110X_WHITE);
+  } else {
+    drawCenteredText("!! OBSTACLE !!", 4);
+  }
+
+  display.setTextSize(1);
+  display.setCursor(4, 20);
+  display.print("OBJ IN PATH - STOP");
+
+  int dL = -1, dR = -1;
+  bool obsL = false, obsR = false, fireActive = false;
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    dL = sData.distLeft; dR = sData.distRight;
+    obsL = sData.obstacleLeft; obsR = sData.obstacleRight;
+    fireActive = sData.fireConfirmed;
+    xSemaphoreGive(dataMutex);
+  }
+
+  int yp = 31;
+  if (US_FL_CONNECTED && !compErrorL) {
+    char buf[20]; snprintf(buf, sizeof(buf), "L:%dcm %s", dL, obsL ? "STOP" : "OK");
+    display.setCursor(4, yp); display.print(buf); yp += 10;
+  }
+  if (US_FR_CONNECTED && !compErrorR) {
+    char buf[20]; snprintf(buf, sizeof(buf), "R:%dcm %s", dR, obsR ? "STOP" : "OK");
+    display.setCursor(4, yp); display.print(buf); yp += 10;
+  }
+
+  display.drawLine(0, yp + 1, SCREEN_W, yp + 1, SH110X_WHITE);
+  display.setCursor(4, yp + 5);
+  if (fireActive) {
+    display.print("Fire:ON Srv:"); display.print(servoAngle); display.print("d");
+  } else {
+    display.print("Fire:clear Rly:OFF");
+  }
+  drawWiFiIcon(110, yp + 4);
+}
+
+// ============================================================
+//   SCREEN 5: SENSOR FAULT DIAGNOSTICS HUD
+// ============================================================
+void drawComponentError() {
+  drawDashedBorder(animTick);
+  display.fillRect(2, 2, SCREEN_W - 4, 13, SH110X_WHITE);
+  display.setTextColor(SH110X_BLACK);
+  drawCenteredText("[!] SYS ALERT", 4);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setTextSize(1);
+  int y = 19;
+  if (compErrorL && US_FL_CONNECTED) {
+    display.setCursor(4, y); display.print("US-Left : NO SIGNAL"); y += 10;
+  }
+  if (compErrorR && US_FR_CONNECTED) {
+    display.setCursor(4, y); display.print("US-Right: NO SIGNAL"); y += 10;
+  }
+
+  display.drawLine(2, y + 1, SCREEN_W - 2, y + 1, SH110X_WHITE);
+  y += 4;
+
+  char dots[6] = "";
+  int d = (animTick / 4) % 5;
+  for (int i = 0; i < d; i++) strcat(dots, ".");
+  char chk[22]; snprintf(chk, sizeof(chk), "Check wiring%-4s", dots);
+  display.setCursor(4, y + 1); display.print(chk); y += 11;
+
+  display.setCursor(4, y + 1);
+  display.print("Rly:"); display.print(relayOn ? "ON " : "OFF");
+  display.print(" Srv:"); display.print(servoAngle); display.print("d");
+  drawWiFiIcon(110, y);
+}
