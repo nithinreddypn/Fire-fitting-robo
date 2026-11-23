@@ -267,9 +267,9 @@ void taskAcousticOutput(void *pvParameters) {
   dac_output_enable(DAC_CHANNEL_2);
   dac_output_voltage(DAC_CHANNEL_2, 128); // Midpoint DC bias
 
-  // Ensure DAC1 on GPIO 25 remains disconnected and released to digital motor PWM
+  // Ensure DAC1 on GPIO 25 remains disconnected from DAC peripheral
+  // NOTE: Never call rtc_gpio_deinit() here as it would unbind GPIO 25 from the LEDC PWM matrix!
   dac_output_disable(DAC_CHANNEL_1);
-  rtc_gpio_deinit(GPIO_NUM_25);
 
   // 1. Diagnostic Power-on Boot Chord: 523Hz (C5), 659Hz (E5), 784Hz (G5) ~160ms each
   const int chordFreqs[3] = {523, 659, 784};
@@ -563,15 +563,19 @@ void setUpPinModes()
   Serial.println("Servos initialized successfully");
  
   // CRITICAL FIX FOR GPIO 25 (LEFT_MOTOR_IN2):
-  // 1. Explicitly detach DAC1 and RTC subsystem from GPIO 25 so it functions as a digital GPIO
+  // 1. Explicitly detach DAC1 from GPIO 25 so it functions as a 100% digital GPIO
   dac_output_disable(DAC_CHANNEL_1);
-  rtc_gpio_deinit(GPIO_NUM_25);
 
-  // 2. Explicitly configure all 4 motor pins as standard digital OUTPUTs
+  // 2. Explicitly configure all 4 motor pins as standard digital OUTPUTs with maximum drive strength (40mA)
   pinMode(RIGHT_MOTOR_IN1, OUTPUT);
   pinMode(RIGHT_MOTOR_IN2, OUTPUT);
   pinMode(LEFT_MOTOR_IN1,  OUTPUT);
   pinMode(LEFT_MOTOR_IN2,  OUTPUT);
+
+  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN1, GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN2, GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1,  GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2,  GPIO_DRIVE_CAP_3);
 
   digitalWrite(RIGHT_MOTOR_IN1, LOW);
   digitalWrite(RIGHT_MOTOR_IN2, LOW);
@@ -590,7 +594,7 @@ void setUpPinModes()
   MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,  CH_LM_IN2, 0);
 
   moveCar(STOP);
-  Serial.println("Motor pins initialized (Dedicated LEDC PWM Channels 4, 5, 6, 7; GPIO 25 DAC1 freed)");
+  Serial.println("Motor pins initialized (Dedicated LEDC PWM Channels 4, 5, 6, 7; GPIO 25 40mA max drive)");
 
   // Setup light pin
   pinMode(LIGHT_PIN, OUTPUT);    
