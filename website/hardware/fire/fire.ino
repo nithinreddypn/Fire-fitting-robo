@@ -8,13 +8,32 @@
 #include <Adafruit_NeoPixel.h>
 #include <Wire.h>
 #include <driver/dac.h>
+#include <driver/rtc_io.h>
 #include "robot_status.h"
 
 // ── Motor Pins (PWM on IN pins directly, EnA & EnB removed) ──
-#define RIGHT_MOTOR_IN1 14  // Right Motor IN1 (PWM Forward)
-#define RIGHT_MOTOR_IN2 27  // Right Motor IN2 (PWM Backward)
-#define LEFT_MOTOR_IN1  19  // Left Motor IN1  (PWM Forward) - Moved from 26 to free DAC2 for Acoustic Audio
-#define LEFT_MOTOR_IN2  25  // Left Motor IN2  (PWM Backward)
+#define RIGHT_MOTOR_IN1     14  // Right Motor IN1 (PWM Forward)
+#define RIGHT_MOTOR_IN2     27  // Right Motor IN2 (PWM Backward)
+#define LEFT_MOTOR_IN1      19  // Left Motor IN1  (PWM Forward)
+#define LEFT_MOTOR_IN2      25  // Left Motor IN2  (PWM Backward - Primary Pin)
+#define LEFT_MOTOR_IN2_ALT  23  // Left Motor IN2  (PWM Backward - Parallel Mirror Pin on GPIO 23)
+
+// Dedicated LEDC PWM Channels for Motors (Prevents Timer Theft from Servos)
+#define MOTOR_PWM_FREQ 1000  // 1 kHz smooth PWM
+#define MOTOR_PWM_RES  8     // 8-bit resolution (0-255)
+#define CH_RM_IN1     4
+#define CH_RM_IN2     5
+#define CH_LM_IN1     6
+#define CH_LM_IN2     7
+#define CH_LM_IN2_ALT 3      // High-speed Timer 1, Channel 3 for GPIO 23 mirror
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define MOTOR_PWM_ATTACH(pin, ch, freq, res) ledcAttach(pin, freq, res)
+  #define MOTOR_PWM_WRITE(pin, ch, duty)       ledcWrite(pin, duty)
+#else
+  #define MOTOR_PWM_ATTACH(pin, ch, freq, res) do { ledcSetup(ch, freq, res); ledcAttachPin(pin, ch); } while(0)
+  #define MOTOR_PWM_WRITE(pin, ch, duty)       ledcWrite(ch, duty)
+#endif
 
 // ── Acoustic Audio Cannon (TPA3116D2 + 8Ω 0.5W Speaker) ──
 #define DAC_AUDIO_PIN   26  // ESP32 DAC2 (GPIO 26) -> TPA3116D2 Audio IN
@@ -246,9 +265,13 @@ void bootAnimation() {
 //   2. Hardware Potentiometer Attenuation (recommended 25%-40% gain)
 //   3. Zero DC Standby Heating: DAC parked at 128 bias (1.65V DC). AC-coupling cap blocks DC entirely (0.00V AC, 0 mA)
 void taskAcousticOutput(void *pvParameters) {
-  // Initialize DAC2 on GPIO 26
+  // Initialize DAC2 on GPIO 26 ONLY
   dac_output_enable(DAC_CHANNEL_2);
   dac_output_voltage(DAC_CHANNEL_2, 128); // Midpoint DC bias
+
+  // Ensure DAC1 on GPIO 25 remains disconnected from DAC peripheral
+  // NOTE: Never call rtc_gpio_deinit() here as it would unbind GPIO 25 from the LEDC PWM matrix!
+  dac_output_disable(DAC_CHANNEL_1);
 
   // 1. Diagnostic Power-on Boot Chord: 523Hz (C5), 659Hz (E5), 784Hz (G5) ~160ms each
   const int chordFreqs[3] = {523, 659, 784};
@@ -327,56 +350,67 @@ long readUltrasonicDistanceCM() {
   return duration * 0.034 / 2;
 }
 
-// ── Motor Control via Direct PWM on IN pins (No EnA/EnB) ──
+// ── Motor Control via Dedicated LEDC PWM (No EnA/EnB, No Servo Timer Stealing) ──
 void rotateMotor(int motorNumber, int motorDirection)
 {
+  // Apply Minimum Torque Deadband Clamp (avoids hum/stall below PWM 130)
+  int speed = (currentSpeed > 0) ? map(constrain(currentSpeed, 1, 255), 1, 255, 135, 255) : 0;
+
   if (motorNumber == RIGHT_MOTOR)
   {
     if (motorDirection == FORWARD)
     {
-      digitalWrite(RIGHT_MOTOR_IN2, LOW);
-      analogWrite(RIGHT_MOTOR_IN1, currentSpeed);
-      Serial.printf("Right Motor: FORWARD on Pin %d (PWM:%d), Pin %d LOW\n", RIGHT_MOTOR_IN1, currentSpeed, RIGHT_MOTOR_IN2);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, 0);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, speed);
+      Serial.printf("Right Motor: FORWARD on Pin %d (PWM:%d)\n", RIGHT_MOTOR_IN1, speed);
     }
     else if (motorDirection == BACKWARD)
     {
-      digitalWrite(RIGHT_MOTOR_IN1, LOW);
-      analogWrite(RIGHT_MOTOR_IN2, currentSpeed);
-      Serial.printf("Right Motor: BACKWARD on Pin %d (PWM:%d), Pin %d LOW\n", RIGHT_MOTOR_IN2, currentSpeed, RIGHT_MOTOR_IN1);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, 0);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, speed);
+      Serial.printf("Right Motor: BACKWARD on Pin %d (PWM:%d)\n", RIGHT_MOTOR_IN2, speed);
     }
     else
     {
-      analogWrite(RIGHT_MOTOR_IN1, 0);
-      analogWrite(RIGHT_MOTOR_IN2, 0);
-      digitalWrite(RIGHT_MOTOR_IN1, LOW);
-      digitalWrite(RIGHT_MOTOR_IN2, LOW);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, 0);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, 0);
     }
   }
   else if (motorNumber == LEFT_MOTOR)
   {
     if (motorDirection == FORWARD)
     {
-      digitalWrite(LEFT_MOTOR_IN2, LOW);
-      analogWrite(LEFT_MOTOR_IN1, currentSpeed);
-      Serial.printf("Left Motor: FORWARD on Pin %d (PWM:%d), Pin %d LOW\n", LEFT_MOTOR_IN1, currentSpeed, LEFT_MOTOR_IN2);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     speed);
+      Serial.printf("Left Motor: FORWARD on Pin %d (PWM:%d)\n", LEFT_MOTOR_IN1, speed);
     }
     else if (motorDirection == BACKWARD)
     {
-      digitalWrite(LEFT_MOTOR_IN1, LOW);
-      analogWrite(LEFT_MOTOR_IN2, currentSpeed);
-      Serial.printf("Left Motor: BACKWARD on Pin %d (PWM:%d), Pin %d LOW\n", LEFT_MOTOR_IN2, currentSpeed, LEFT_MOTOR_IN1);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     speed);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, speed);
+      Serial.printf("Left Motor: BACKWARD on Pins %d & %d (PWM:%d)\n", LEFT_MOTOR_IN2, LEFT_MOTOR_IN2_ALT, speed);
     }
     else
     {
-      analogWrite(LEFT_MOTOR_IN1, 0);
-      analogWrite(LEFT_MOTOR_IN2, 0);
-      digitalWrite(LEFT_MOTOR_IN1, LOW);
-      digitalWrite(LEFT_MOTOR_IN2, LOW);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
     }
   }
 }
 
 void moveCar(int inputValue) {
+  static int prevCarState = STOP;
+  // Enforce shoot-through / brownout protection: 15ms stop dead-time when changing direction
+  if (prevCarState != inputValue && prevCarState != STOP && inputValue != STOP) {
+    rotateMotor(RIGHT_MOTOR, STOP);
+    rotateMotor(LEFT_MOTOR, STOP);
+    delay(15);
+  }
+  prevCarState = inputValue;
+
   currentCarState = inputValue;
   Serial.printf("Got value as %d (Speed: %d)\n", inputValue, currentSpeed);
   switch(inputValue) {
@@ -533,19 +567,26 @@ void setUpPinModes()
   delay(300); // Give servos time to reach position
   Serial.println("Servos initialized successfully");
  
-  // Setup Motor Pins as OUTPUT explicitly
-  pinMode(RIGHT_MOTOR_IN1, OUTPUT);
-  pinMode(RIGHT_MOTOR_IN2, OUTPUT);
-  pinMode(LEFT_MOTOR_IN1,  OUTPUT);
-  pinMode(LEFT_MOTOR_IN2,  OUTPUT);
+  // ── Motor Setup via Dedicated LEDC PWM Channels ──
+  // 1. Explicitly detach DAC1 from GPIO 25 so it can output digital PWM
+  dac_output_disable(DAC_CHANNEL_1);
 
-  digitalWrite(RIGHT_MOTOR_IN1, LOW);
-  digitalWrite(RIGHT_MOTOR_IN2, LOW);
-  digitalWrite(LEFT_MOTOR_IN1,  LOW);
-  digitalWrite(LEFT_MOTOR_IN2,  LOW);
+  // 2. Attach Dedicated LEDC PWM Channels directly (Avoid calling pinMode which detaches LEDC peripheral)
+  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN1,    CH_RM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN2,    CH_RM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1,     CH_LM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2,     CH_LM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+
+  // 3. Ensure all motor outputs start at 0 (Off)
+  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1,    CH_RM_IN1,     0);
+  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2,    CH_RM_IN2,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
 
   moveCar(STOP);
-  Serial.println("Motor pins initialized (analogWrite PWM, No EnA/EnB)");
+  Serial.println("Motor pins initialized (LEDC Channels: RM 4,5; LM 6,7 & GPIO 23 mirror CH 3)");
 
   // Setup light pin
   pinMode(LIGHT_PIN, OUTPUT);    
