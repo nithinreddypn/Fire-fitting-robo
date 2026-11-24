@@ -62,6 +62,49 @@ bool oledOK = false;
 volatile bool relayOn = false;
 
 // ============================================================
+//   AUTONOMOUS MOTOR DRIVER (Dedicated Hardware Timers 2 & 3: Channels 4-7)
+//   Hardware Pins:
+//     Right Motor: GPIO 14 (IN1 Forward),  GPIO 27 (IN2 Backward)
+//     Left Motor:  GPIO 25 (IN1 Forward),  GPIO 26 (IN2 Backward)
+//                  GPIO 23 (IN2 Backward Mirror via GPIO Matrix)
+// ============================================================
+#define RIGHT_MOTOR_IN1     14
+#define RIGHT_MOTOR_IN2     27
+#define LEFT_MOTOR_IN1      25
+#define LEFT_MOTOR_IN2      26
+#define LEFT_MOTOR_IN2_ALT  23
+
+#define MOTOR_PWM_FREQ 1000
+#define MOTOR_PWM_RES  8
+#define CH_RM_IN1     4
+#define CH_RM_IN2     5
+#define CH_LM_IN1     6
+#define CH_LM_IN2     7
+#define CH_LM_IN2_ALT 7
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define MOTOR_PWM_ATTACH(pin, ch, freq, res) ledcAttach(pin, freq, res)
+  #define MOTOR_PWM_WRITE(pin, ch, duty)       ledcWrite(pin, duty)
+#else
+  #define MOTOR_PWM_ATTACH(pin, ch, freq, res) do { ledcSetup(ch, freq, res); ledcAttachPin(pin, ch); } while(0)
+  #define MOTOR_PWM_WRITE(pin, ch, duty)       ledcWrite(ch, duty)
+#endif
+
+#define UP 1
+#define DOWN 2
+#define LEFT 3
+#define RIGHT 4
+#define STOP 0
+
+#define RIGHT_MOTOR 0
+#define LEFT_MOTOR 1
+#define FORWARD 1
+#define BACKWARD -1
+
+#define AUTO_DRIVE_SPEED 185
+#define AUTO_TURN_SPEED  195
+
+// ============================================================
 //   NOZZLE SERVO ACTUATOR (GPIO 13)
 // ============================================================
 #define SERVO_PIN        13
@@ -217,6 +260,127 @@ void updateScreenPriority();
 void setRelay(bool on);
 void setServoToSensor(int sensorIdx);
 void setServoAngle(int angle);
+
+// ============================================================
+//   AUTONOMOUS MOTOR CONTROL FUNCTIONS
+// ============================================================
+void rotateMotor(int motorNumber, int motorDirection, int targetSpeed)
+{
+  int speed = (targetSpeed > 0) ? map(constrain(targetSpeed, 1, 255), 1, 255, 135, 255) : 0;
+
+  if (motorNumber == RIGHT_MOTOR)
+  {
+    if (motorDirection == FORWARD)
+    {
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, 0);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, speed);
+    }
+    else if (motorDirection == BACKWARD)
+    {
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, 0);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, speed);
+    }
+    else
+    {
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, 0);
+      MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, 0);
+    }
+  }
+  else if (motorNumber == LEFT_MOTOR)
+  {
+    if (motorDirection == FORWARD)
+    {
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     speed);
+    }
+    else if (motorDirection == BACKWARD)
+    {
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     speed);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, speed);
+    }
+    else
+    {
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
+    }
+  }
+}
+
+void moveCar(int inputValue) {
+  static int prevCarState = STOP;
+  if (prevCarState != inputValue && prevCarState != STOP && inputValue != STOP) {
+    rotateMotor(RIGHT_MOTOR, STOP, 0);
+    rotateMotor(LEFT_MOTOR, STOP, 0);
+    delay(15);
+  }
+  prevCarState = inputValue;
+
+  switch(inputValue) {
+    case UP:
+      rotateMotor(RIGHT_MOTOR, FORWARD, AUTO_DRIVE_SPEED);
+      rotateMotor(LEFT_MOTOR, FORWARD, AUTO_DRIVE_SPEED);
+      break;
+    
+    case DOWN:
+      rotateMotor(RIGHT_MOTOR, BACKWARD, AUTO_DRIVE_SPEED);
+      rotateMotor(LEFT_MOTOR, BACKWARD, AUTO_DRIVE_SPEED);
+      break;
+    
+    case LEFT:
+      rotateMotor(RIGHT_MOTOR, FORWARD, AUTO_TURN_SPEED);
+      rotateMotor(LEFT_MOTOR, BACKWARD, AUTO_TURN_SPEED);
+      break;
+
+    case RIGHT:
+      rotateMotor(RIGHT_MOTOR, BACKWARD, AUTO_TURN_SPEED);
+      rotateMotor(LEFT_MOTOR, FORWARD, AUTO_TURN_SPEED);
+      break;
+        
+    case STOP:
+    default:
+      rotateMotor(RIGHT_MOTOR, STOP, 0);
+      rotateMotor(LEFT_MOTOR, STOP, 0);
+      break;
+  }
+}
+
+void setupMotors() {
+  pinMode(RIGHT_MOTOR_IN1,    OUTPUT);
+  pinMode(RIGHT_MOTOR_IN2,    OUTPUT);
+  pinMode(LEFT_MOTOR_IN1,     OUTPUT);
+  pinMode(LEFT_MOTOR_IN2,     OUTPUT);
+  pinMode(LEFT_MOTOR_IN2_ALT, OUTPUT);
+
+  digitalWrite(RIGHT_MOTOR_IN1,    LOW);
+  digitalWrite(RIGHT_MOTOR_IN2,    LOW);
+  digitalWrite(LEFT_MOTOR_IN1,     LOW);
+  digitalWrite(LEFT_MOTOR_IN2,     LOW);
+  digitalWrite(LEFT_MOTOR_IN2_ALT, LOW);
+
+  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN1,    GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN2,    GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1,     GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2,     GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2_ALT, GPIO_DRIVE_CAP_3);
+
+  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN1,    CH_RM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN2,    CH_RM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1,     CH_LM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2,     CH_LM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+
+  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1,    CH_RM_IN1,     0);
+  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2,    CH_RM_IN2,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
+
+  moveCar(STOP);
+  Serial.println("[INIT] Autonomous Motors -> Channels 4-7 (Timers 2 & 3) Standstill Initialized");
+}
 
 // ============================================================
 //   ACTUATOR CONTROLS
@@ -409,7 +573,6 @@ void taskSensors(void* param) {
             sData.fireDirection  = SENSOR_DIR[strongestIdx];
             sData.status         = "Fire!";
             fireStartTime        = millis();
-            setRelay(true);
             setServoToSensor(strongestIdx);
             Serial.println("==================================================");
             Serial.print("  [HAZARD LOCK] CONFIRMED FIRE: Sector ");
@@ -417,7 +580,7 @@ void taskSensors(void* param) {
             Serial.print(" (Sensor S"); Serial.print(strongestIdx + 1);
             Serial.print(" on GPIO "); Serial.print(SENSOR_PINS[strongestIdx]);
             Serial.print(") | Intensity: "); Serial.print(sData.intensity);
-            Serial.print("% | Servo: ");
+            Serial.print("% | Servo Aim: ");
             Serial.print(SENSOR_SERVO_ANGLE[strongestIdx]);
             Serial.println(" deg");
             Serial.println("==================================================");
@@ -425,6 +588,32 @@ void taskSensors(void* param) {
             sData.strongestIndex = strongestIdx;
             sData.fireDirection  = SENSOR_DIR[strongestIdx];
             setServoToSensor(strongestIdx);
+          }
+
+          // ── Autonomous Navigation & Extinguishing Motion Control ──
+          int sIdx = sData.strongestIndex;
+          if (sIdx == 0 || sIdx == 1) {
+            // Fire is on the LEFT -> Rotate rover left to center the fire
+            setRelay(false); // Conserve water while turning
+            moveCar(LEFT);
+          } 
+          else if (sIdx == 3 || sIdx == 4) {
+            // Fire is on the RIGHT -> Rotate rover right to center the fire
+            setRelay(false); // Conserve water while turning
+            moveCar(RIGHT);
+          } 
+          else {
+            // Fire is DIRECTLY IN FRONT (Sensor S3 / Center)
+            if (dist > 28) {
+              // Further than 28cm -> Advance forward toward flame
+              setRelay(false); // Conserve water while driving
+              moveCar(UP);
+            } else {
+              // Within 28cm standoff distance -> STOP and SPRAY WATER!
+              moveCar(STOP);
+              setRelay(true);      // Engage pump
+              setServoToSensor(2); // Center nozzle at 90 deg directly onto fire
+            }
           }
         }
       } else {
@@ -437,8 +626,11 @@ void taskSensors(void* param) {
           fireStartTime       = 0;
           inObstacleWindow    = false;
           setRelay(false);
+          moveCar(STOP);
           setServoAngle(SERVO_STANDBY);
-          Serial.println("[FIRE RESOLVED] All vectors clear. Extinguisher pump OFF, Servo 90 deg.");
+          Serial.println("[FIRE RESOLVED] All vectors clear. Extinguisher pump OFF, Motors STOP, Servo 90 deg.");
+        } else {
+          moveCar(STOP);
         }
       }
 
@@ -679,6 +871,9 @@ void setup() {
   digitalWrite(RELAY_PIN, LOW);
   relayOn = false;
   Serial.println("[INIT] Water Pump Relay -> GPIO 19 Initialized (LOW)");
+
+  // Initialize Autonomous Motor Driver (Hardware Channels 4-7, Timers 2 & 3)
+  setupMotors();
 
   // Initialize Extinguisher Nozzle Servo
   ESP32PWM::allocateTimer(1);
