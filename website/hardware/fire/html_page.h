@@ -840,7 +840,7 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             </div>
 
             <div class="control-row" id="wDirectionControl">
-                <div class="control-label">Sonar Sweep</div>
+                <div class="control-label">Sonar Sweep <span id="sonarDistBadge" style="font-size:11px;color:#00e5ff;margin-left:6px;font-weight:600;">-- cm</span></div>
                 <div class="control-widget"><input type="range" min="0" max="180" value="90" class="slider" id="Tilt" aria-label="Sonar sweep"></div>
                 <div class="value-display" id="TiltValue">90°</div>
             </div>
@@ -1109,6 +1109,27 @@ const char htmlHomePage[] PROGMEM = R"HTMLHOMEPAGE(<!DOCTYPE html>
             scheduleReconnect();
         };
         ws.onerror = function () { setStatus("Control connection error", false); };
+        ws.onmessage = function (event) {
+            try {
+                var msg = JSON.parse(event.data);
+                if (msg.type === "sonar") {
+                    var badge = $("sonarDistBadge");
+                    if (badge) {
+                        var d = parseInt(msg.dist, 10);
+                        if (d > 0 && d <= 25) {
+                            badge.textContent = d + " cm [STOP]";
+                            badge.style.color = "#ff3b30";
+                        } else if (d > 0 && d < 400) {
+                            badge.textContent = d + " cm";
+                            badge.style.color = "#00e5ff";
+                        } else {
+                            badge.textContent = "Clear";
+                            badge.style.color = "#34c759";
+                        }
+                    }
+                }
+            } catch (e) {}
+        };
     }
 
     function scheduleReconnect() {

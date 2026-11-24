@@ -486,17 +486,66 @@ void updateScreenPriority() {
 
 // ============================================================
 //   ULTRASONIC TIMING MEASUREMENT (HC-SR04)
+//   Hardware: TRIG = GPIO 5, ECHO = GPIO 18
+//   Rock-solid 3-sample median filter with settle guard
 // ============================================================
-int readUltrasonic(int trigPin, int echoPin) {
+int readUltrasonicRaw(int trigPin, int echoPin) {
+  // Settle TRIG LOW
   digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(4);
+
+  // Settle guard: If ECHO is stuck HIGH from previous sonic bounce, wait up to 1ms
+  unsigned long settleStart = micros();
+  while (digitalRead(echoPin) == HIGH && (micros() - settleStart) < 1000) {
+    delayMicroseconds(10);
+  }
+
+  // Trigger pulse: 10µs HIGH
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  long dur = pulseIn(echoPin, HIGH, 25000); // 25ms timeout (~4.3m max)
-  if (dur == 0) return US_MAX_CM;
-  return constrain((int)(dur / 58), 0, US_MAX_CM);
+  // pulseIn with 22ms timeout (~3.8m range)
+  unsigned long dur = pulseIn(echoPin, HIGH, 22000);
+  if (dur == 0) return -1; // Echo missed or out of range
+  int cm = (int)(dur / 58);
+  if (cm < 2 || cm > US_MAX_CM) return -1;
+  return cm;
+}
+
+int readUltrasonic(int trigPin, int echoPin) {
+  int samples[3];
+  int validCount = 0;
+
+  for (int i = 0; i < 3; i++) {
+    int r = readUltrasonicRaw(trigPin, echoPin);
+    if (r > 0) {
+      samples[validCount++] = r;
+    }
+    if (i < 2) delayMicroseconds(800); // Inter-ping acoustic settle delay
+  }
+
+  static int lastValidDist = US_MAX_CM;
+
+  if (validCount == 0) {
+    // If all 3 samples missed, preserve last valid reading (prevents dropouts)
+    return lastValidDist;
+  }
+
+  // Sort valid samples to obtain median
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = i + 1; j < validCount; j++) {
+      if (samples[i] > samples[j]) {
+        int tmp = samples[i];
+        samples[i] = samples[j];
+        samples[j] = tmp;
+      }
+    }
+  }
+
+  int median = samples[validCount / 2];
+  lastValidDist = median;
+  return median;
 }
 
 // ============================================================
@@ -545,7 +594,15 @@ void taskSensors(void* param) {
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       sData.distLeft      = dist;
       sData.distRight     = dist;
-      sData.obstacleLeft  = (dist > 0 && dist <= OBSTACLE_CM);
+
+      // 2-Cycle Debounced Obstacle Detection (eliminates transient sensor glitches)
+      static int obsCounter = 0;
+      if (dist > 0 && dist <= OBSTACLE_CM) {
+        if (obsCounter < 2) obsCounter++;
+      } else {
+        if (obsCounter > 0) obsCounter--;
+      }
+      sData.obstacleLeft  = (obsCounter >= 2);
       sData.obstacleRight = false;
 
       // Read 5 flame sensor channels (Analog & Digital Hybrid Evaluation)
@@ -649,23 +706,27 @@ void taskSensors(void* param) {
       xSemaphoreGive(dataMutex);
     }
 
-    // Status heartbeat print every 5 seconds
+    // Status heartbeat print every 1.5 seconds (or immediately on fire/obstacle state change)
     static unsigned long lastPrint = 0;
     static bool lastFire = false;
-    if (sData.fireConfirmed != lastFire || millis() - lastPrint >= 5000) {
+    static bool lastObs = false;
+    if (sData.fireConfirmed != lastFire || sData.obstacleLeft != lastObs || millis() - lastPrint >= 1500) {
       lastPrint = millis();
       lastFire = sData.fireConfirmed;
+      lastObs = sData.obstacleLeft;
       if (!sData.fireConfirmed) {
         Serial.print("[FLAME MATRIX] ");
         for (int i = 0; i < NUM_SENSORS; i++) {
           Serial.print(SENSOR_SHORT_LABEL[i]); Serial.print(":");
           Serial.print(sData.values[i]); Serial.print(" ");
         }
-        Serial.print("-> Status: CLEAR | ");
-        if (US_CONNECTED) {
-          Serial.print("Sonar=");
-          Serial.print(dist);
-          Serial.print("cm ");
+        Serial.print("-> Status: ");
+        Serial.print(sData.obstacleLeft ? "OBSTACLE " : "CLEAR ");
+        Serial.print("| Sonar=");
+        if (dist > 0 && dist < US_MAX_CM) {
+          Serial.print(dist); Serial.print("cm ");
+        } else {
+          Serial.print("CLR ");
         }
         Serial.print("| Servo="); Serial.print(servoAngle); Serial.println("deg");
       }
@@ -1249,11 +1310,25 @@ void drawNormal() {
   if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
     if (gpsData.valid) {
       display.print("GPS:"); display.print((int)gpsData.satellites);
-      display.print("sat");
+      display.print("s");
     } else {
-      display.print("GPS:searching");
+      display.print("GPS:scan");
     }
     xSemaphoreGive(gpsMutex);
+  }
+
+  // Live Ultrasonic Distance readout on bottom row
+  display.setCursor(68, 56);
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
+    int d = sData.distLeft;
+    xSemaphoreGive(dataMutex);
+    display.print("US:");
+    if (d <= 0 || d >= US_MAX_CM) {
+      display.print("CLR");
+    } else {
+      display.print(d);
+      display.print("cm");
+    }
   }
 }
 

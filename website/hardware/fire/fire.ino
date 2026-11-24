@@ -352,16 +352,57 @@ void taskAcousticOutput(void *pvParameters) {
 }
 
 
-// ── Ultrasonic Distance Read Function ──
-long readUltrasonicDistanceCM() {
+// ── Ultrasonic Distance Read Function (3-Sample Median Filter with Settle Guard) ──
+long readUltrasonicRawCM() {
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(4);
+
+  // Settle guard: wait if ECHO line is lingering HIGH
+  unsigned long settleStart = micros();
+  while (digitalRead(ULTRASONIC_ECHO_PIN) == HIGH && (micros() - settleStart) < 1000) {
+    delayMicroseconds(10);
+  }
+
   digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
-  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 30000); // 30ms timeout (~5m max)
+
+  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 22000); // 22ms timeout (~3.8m max)
   if (duration == 0) return -1;
-  return duration * 0.034 / 2;
+  int cm = (int)(duration / 58);
+  if (cm < 2 || cm > 400) return -1;
+  return cm;
+}
+
+long readUltrasonicDistanceCM() {
+  long samples[3];
+  int validCount = 0;
+
+  for (int i = 0; i < 3; i++) {
+    long r = readUltrasonicRawCM();
+    if (r > 0) {
+      samples[validCount++] = r;
+    }
+    if (i < 2) delayMicroseconds(800);
+  }
+
+  static long lastValidDist = 400;
+  if (validCount == 0) return lastValidDist;
+
+  // Sort samples for median
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = i + 1; j < validCount; j++) {
+      if (samples[i] > samples[j]) {
+        long tmp = samples[i];
+        samples[i] = samples[j];
+        samples[j] = tmp;
+      }
+    }
+  }
+
+  long median = samples[validCount / 2];
+  lastValidDist = median;
+  return median;
 }
 
 // ── Motor Control via Dedicated LEDC PWM (No EnA/EnB, No Servo Timer Stealing) ──
@@ -731,4 +772,34 @@ void loop()
 {
   wsCarInput.cleanupClients();
   updateNeoPixels();
+
+  // Periodic Ultrasonic Proximity & Safety Scan (every 120ms)
+  static unsigned long lastSonarScan = 0;
+  static int lastReportedDist = -999;
+  unsigned long now = millis();
+
+  if (now - lastSonarScan >= 120) {
+    lastSonarScan = now;
+    long dist = readUltrasonicDistanceCM();
+
+    // Safety Forward Obstacle Interlock:
+    // If driving FORWARD toward an obstacle <= 25cm, auto-halt motors to prevent collision
+    if (currentCarState == UP && dist > 0 && dist <= 25) {
+      Serial.printf("[SONAR BRAKE] Obstacle detected at %ld cm! Auto-stopping forward drive.\n", dist);
+      moveCar(STOP);
+    }
+
+    // Print & Broadcast if distance changed by >= 5cm or every 1.5s
+    static unsigned long lastLog = 0;
+    if (abs((int)dist - lastReportedDist) >= 5 || now - lastLog >= 1500) {
+      lastReportedDist = (int)dist;
+      lastLog = now;
+      Serial.printf("[SONAR] Distance: %ld cm | Servo: %d deg | State: %d\n", dist, ultrasonicServo.read(), currentCarState);
+
+      // Broadcast live sonar telemetry to all connected WebSocket clients
+      char jsonBuf[64];
+      snprintf(jsonBuf, sizeof(jsonBuf), "{\"type\":\"sonar\",\"dist\":%ld,\"servo\":%d}", dist, ultrasonicServo.read());
+      wsCarInput.textAll(jsonBuf);
+    }
+  }
 }
