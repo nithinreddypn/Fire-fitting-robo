@@ -68,7 +68,7 @@ volatile bool relayOn = false;
 #define SERVO_STANDBY    90
 Servo fireServo;
 volatile int servoAngle = SERVO_STANDBY;
-const int SENSOR_SERVO_ANGLE[5] = { 45, 90, 135, 0, 180 };
+const int SENSOR_SERVO_ANGLE[5] = { 30, 60, 90, 120, 150 };
 
 // ============================================================
 //   GPS MODULE — NEO-6M on HardwareSerial(2) (RX=16, TX=17)
@@ -118,7 +118,7 @@ volatile bool compErrorR = false;
 //   WIFI & SUPABASE CLOUD ENDPOINTS (LIVE SYNCHRONIZATION)
 // ============================================================
 const char* WIFI_SSID         = "NOVA..";
-const char* WIFI_PASSWORD     = "Nova@7399..";
+const char* WIFI_PASSWORD     = "Nova@7399...";
 
 // User Live Supabase Project & Anon API Key
 const char* SUPABASE_URL      = "https://awktiffbxwhwuhkmpfvu.supabase.co";
@@ -127,20 +127,25 @@ const char* SUPABASE_TABLE    = "/rest/v1/fire_events";
 
 // ============================================================
 //   5-CHANNEL IR FLAME PHOTODIODE MATRIX
-//   Index 0: GPIO 33 -> Front-Left   (45°)
-//   Index 1: GPIO 32 -> Front-Center (90°)
-//   Index 2: GPIO 35 -> Front-Right  (135°)
-//   Index 3: GPIO 34 -> Left Flank   (0°)
-//   Index 4: GPIO 39 -> Right Flank  (180°)
+//   User Wiring: A1/D1 -> GPIO 33 ... continuous ... A5/D5 -> GPIO 39
+//     Index 0: GPIO 33 (A1/D1) -> Left Flank    (Servo:  30°)
+//     Index 1: GPIO 32 (A2/D2) -> Front-Left    (Servo:  60°)
+//     Index 2: GPIO 35 (A3/D3) -> Front-Center  (Servo:  90° Straight Ahead)
+//     Index 3: GPIO 34 (A4/D4) -> Front-Right   (Servo: 120°)
+//     Index 4: GPIO 39 (A5/D5) -> Right Flank   (Servo: 150°)
 // ============================================================
 #define NUM_SENSORS 5
 const int SENSOR_PINS[NUM_SENSORS]  = { 33, 32, 35, 34, 39 };
 const char* SENSOR_DIR[NUM_SENSORS] = {
-  "Front-Left", "Front-Center", "Front-Right", "Left", "Right"
+  "Left", "Front-Left", "Front-Center", "Front-Right", "Right"
 };
-int  sensorBaseline[NUM_SENSORS] = { 0 };
-int  FIRE_THRESHOLD = 500;
-bool invertedLogic  = false;
+const char* SENSOR_SHORT_LABEL[NUM_SENSORS] = {
+  "L", "FL", "FC", "FR", "R"
+};
+
+int  sensorBaseline[NUM_SENSORS]      = { 0 };
+bool sensorIsRestingHigh[NUM_SENSORS] = { false };
+#define FIRE_DELTA_THRESHOLD 800  // Minimum ADC delta to eliminate WiFi/ambient noise
 const int CONFIRM_COUNT = 3;
 int  confirmCounter     = 0;
 
@@ -149,6 +154,7 @@ int  confirmCounter     = 0;
 // ============================================================
 struct SensorData {
   int  values[NUM_SENSORS];
+  bool sensorFired[NUM_SENSORS];
   int  strongestIndex;
   int  intensity;
   int  activeSensors;
@@ -191,6 +197,7 @@ SemaphoreHandle_t gpsMutex;
 //   FORWARD DECLARATIONS
 // ============================================================
 void calibrateSensors();
+bool evaluateFlameSensor(int i, int rawVal, int &intensityOut);
 void connectWiFi();
 void syncNTP();
 void postToSupabase(const char* ts, int intensity, int active,
@@ -244,6 +251,36 @@ void setServoToSensor(int sensorIdx) {
   Serial.print(" (Target Angle: ");
   Serial.print(angle);
   Serial.println(" deg)");
+}
+
+// ============================================================
+//   UNIVERSAL FLAME DETECTION LOGIC (Supports A1..A5 & D1..D5)
+// ============================================================
+bool evaluateFlameSensor(int i, int rawVal, int &intensityOut) {
+  intensityOut = 0;
+  bool triggered = false;
+  int base = sensorBaseline[i];
+
+  if (sensorIsRestingHigh[i]) {
+    // RESTING-HIGH: Voltage drops on flame detection (or digital Active-LOW)
+    // Requires at least 800 ADC drop AND reading below 2500 ADC (or clean digitalRead LOW)
+    int drop = base - rawVal;
+    if ((drop >= FIRE_DELTA_THRESHOLD && rawVal < 2500) || (digitalRead(SENSOR_PINS[i]) == LOW && rawVal < 1500)) {
+      triggered = true;
+      intensityOut = map(constrain(drop, FIRE_DELTA_THRESHOLD, max(FIRE_DELTA_THRESHOLD + 1, base)), 
+                         FIRE_DELTA_THRESHOLD, max(FIRE_DELTA_THRESHOLD + 1, base), 20, 100);
+    }
+  } else {
+    // RESTING-LOW: Voltage rises on flame detection (or digital Active-HIGH)
+    // Requires at least 800 ADC rise AND reading above 1500 ADC (or clean digitalRead HIGH)
+    int rise = rawVal - base;
+    if ((rise >= FIRE_DELTA_THRESHOLD && rawVal > 1500) || (digitalRead(SENSOR_PINS[i]) == HIGH && rawVal > 2500)) {
+      triggered = true;
+      intensityOut = map(constrain(rise, FIRE_DELTA_THRESHOLD, max(FIRE_DELTA_THRESHOLD + 1, 4095 - base)), 
+                         FIRE_DELTA_THRESHOLD, max(FIRE_DELTA_THRESHOLD + 1, 4095 - base), 20, 100);
+    }
+  }
+  return triggered;
 }
 
 // ============================================================
@@ -362,29 +399,26 @@ void taskSensors(void* param) {
         sData.obstacleRight = (!compErrorR && dR <= OBSTACLE_CM);
       } else { sData.distRight = -1; sData.obstacleRight = false; }
 
-      // Read 5 ADC flame sensor channels
+      // Read 5 flame sensor channels (Analog & Digital Hybrid Evaluation)
       for (int i = 0; i < NUM_SENSORS; i++) {
         int v = analogRead(SENSOR_PINS[i]);
         sData.values[i] = v;
-        int dev = 0;
-        if (invertedLogic) {
-          dev = (v > sensorBaseline[i]) ? (v - sensorBaseline[i]) : 0;
-        } else {
-          dev = (sensorBaseline[i] > v) ? (sensorBaseline[i] - v) : 0;
-        }
-        if (dev > FIRE_THRESHOLD) {
+        int sensorIntensity = 0;
+        bool fired = evaluateFlameSensor(i, v, sensorIntensity);
+        sData.sensorFired[i] = fired;
+
+        if (fired) {
           activeCount++;
           fireThisCycle = true;
-          if (dev > strongest) {
-            strongest = dev;
+          if (sensorIntensity > peakInt) {
+            peakInt = sensorIntensity;
             strongestIdx = i;
-            peakInt = min(100, (dev * 100) / max(1, sensorBaseline[i]));
           }
         }
       }
       sData.activeSensors = activeCount;
 
-      // Fire confirmation filter (Requires 3 consecutive cycles)
+      // Fire confirmation filter (Requires 3 consecutive cycles to engage / disengage)
       if (fireThisCycle && activeCount >= 1) {
         confirmCounter++;
         if (confirmCounter >= CONFIRM_COUNT) {
@@ -400,12 +434,14 @@ void taskSensors(void* param) {
             Serial.println("==================================================");
             Serial.print("  [HAZARD LOCK] CONFIRMED FIRE: Sector ");
             Serial.print(sData.fireDirection);
-            Serial.print(" | Intensity: "); Serial.print(sData.intensity);
+            Serial.print(" (Sensor S"); Serial.print(strongestIdx + 1);
+            Serial.print(" on GPIO "); Serial.print(SENSOR_PINS[strongestIdx]);
+            Serial.print(") | Intensity: "); Serial.print(sData.intensity);
             Serial.print("% | Servo: ");
             Serial.print(SENSOR_SERVO_ANGLE[strongestIdx]);
             Serial.println(" deg");
             Serial.println("==================================================");
-          } else if (strongestIdx != sData.strongestIndex) {
+          } else if (strongestIdx != sData.strongestIndex && strongestIdx >= 0) {
             sData.strongestIndex = strongestIdx;
             sData.fireDirection  = SENSOR_DIR[strongestIdx];
             setServoToSensor(strongestIdx);
@@ -444,11 +480,12 @@ void taskSensors(void* param) {
       lastPrint = millis();
       lastFire = sData.fireConfirmed;
       if (!sData.fireConfirmed) {
-        Serial.print("[ADC MATRIX] ");
+        Serial.print("[FLAME MATRIX] ");
         for (int i = 0; i < NUM_SENSORS; i++) {
-          Serial.print("S"); Serial.print(i);
-          Serial.print(":"); Serial.print(sData.values[i]); Serial.print(" ");
+          Serial.print(SENSOR_SHORT_LABEL[i]); Serial.print(":");
+          Serial.print(sData.values[i]); Serial.print(" ");
         }
+        Serial.print("-> Status: CLEAR | ");
         if (US_FL_CONNECTED) {
           Serial.print("| Sonar L=");
           if (compErrorL) Serial.print("ERR");
@@ -692,6 +729,10 @@ void setup() {
   sData.distRight      = US_FR_CONNECTED ? US_MAX_CM : -1;
   sData.obstacleLeft   = false;
   sData.obstacleRight  = false;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sData.values[i] = 0;
+    sData.sensorFired[i] = false;
+  }
 
   // Initialize I2C OLED
   Wire.begin();
@@ -782,33 +823,29 @@ void loop() {
 //   SENSOR BASELINE AUTO-CALIBRATION
 // ============================================================
 void calibrateSensors() {
+  Serial.println("\n[CALIBRATION] Sampling ambient flame sensor baseline (20 samples)...");
   long sums[NUM_SENSORS] = { 0 };
-  for (int r = 0; r < 12; r++) {
-    for (int i = 0; i < NUM_SENSORS; i++) sums[i] += analogRead(SENSOR_PINS[i]);
-    delay(25);
-  }
-  int total = 0;
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    sensorBaseline[i] = sums[i] / 12;
-    total += sensorBaseline[i];
-    Serial.print("  [CALIBRATED] "); Serial.print(SENSOR_DIR[i]);
-    Serial.print(" (GPIO "); Serial.print(SENSOR_PINS[i]);
-    Serial.print(") Baseline = "); Serial.println(sensorBaseline[i]);
-  }
-  int avg = total / NUM_SENSORS;
-  // Ambient baseline: standard LM393 IR flame modules are pull-up (normally HIGH ~2000-4095; drops when IR flame detected)
-  // Only if baseline is near 0 (< 300) does voltage rise on flame
-  if (avg < 300) {
-    invertedLogic = true;
-    FIRE_THRESHOLD = 200;
-  } else {
-    invertedLogic = false; // Standard pull-up: voltage drops on flame detection
-    FIRE_THRESHOLD = 400;
+  for (int r = 0; r < 20; r++) {
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      sums[i] += analogRead(SENSOR_PINS[i]);
+    }
+    delay(20);
   }
 
-  Serial.print("  [CONFIG] Ambient Mean: "); Serial.print(avg);
-  Serial.print(" | Threshold Delta: "); Serial.print(FIRE_THRESHOLD);
-  Serial.print(" | Inverted Logic: "); Serial.println(invertedLogic ? "YES" : "NO");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sensorBaseline[i] = sums[i] / 20;
+    // If resting baseline > 2000, sensor is Resting-HIGH (drops on fire, or digital Active-LOW)
+    // If resting baseline <= 2000, sensor is Resting-LOW (rises on fire, typical of IR photodiode to VCC)
+    sensorIsRestingHigh[i] = (sensorBaseline[i] > 2000);
+
+    Serial.print("  [CALIBRATED] S"); Serial.print(i + 1);
+    Serial.print(" ("); Serial.print(SENSOR_DIR[i]);
+    Serial.print(" - GPIO "); Serial.print(SENSOR_PINS[i]);
+    Serial.print("): Ambient Baseline = "); Serial.print(sensorBaseline[i]);
+    Serial.print(" | Mode = ");
+    Serial.println(sensorIsRestingHigh[i] ? "RESTING-HIGH (Trip on Drop/LOW)" : "RESTING-LOW (Trip on Rise/HIGH)");
+  }
+  Serial.println("[CALIBRATION] Baseline established. Automatic threshold tracking active.\n");
 }
 
 // ============================================================
@@ -1011,20 +1048,17 @@ void drawNormal() {
 
   display.setCursor(2, 26);
   display.print("SEN:");
-  const char* sd[5] = { "FL", "FC", "FR", "L", "R" };
   for (int i = 0; i < NUM_SENSORS; i++) {
     int cx = 32 + i * 18;
     bool fired = false;
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
-      int v   = sData.values[i];
-      int dev = invertedLogic ? (v - sensorBaseline[i]) : (sensorBaseline[i] - v);
-      fired   = (dev > FIRE_THRESHOLD);
+      fired = sData.sensorFired[i];
       xSemaphoreGive(dataMutex);
     }
     if (fired) display.fillRect(cx - 3, 24, 8, 8, SH110X_WHITE);
-    else        display.drawRect(cx - 3, 24, 8, 8, SH110X_WHITE);
+    else       display.drawRect(cx - 3, 24, 8, 8, SH110X_WHITE);
     display.setCursor(28 + i * 18, 34);
-    display.print(sd[i]);
+    display.print(SENSOR_SHORT_LABEL[i]);
   }
   display.drawLine(0, 44, SCREEN_W, 44, SH110X_WHITE);
 

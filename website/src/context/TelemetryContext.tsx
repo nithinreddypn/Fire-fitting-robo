@@ -11,8 +11,11 @@ import {
   FacilityMapData
 } from '../types/telemetry';
 
-export const DEFAULT_SUPABASE_URL = 'https://awktiffbxwhwuhkmpfvu.supabase.co';
+export const DEFAULT_SUPABASE_URL =
+  (import.meta.env?.VITE_SUPABASE_URL as string) ||
+  'https://awktiffbxwhwuhkmpfvu.supabase.co';
 export const DEFAULT_SUPABASE_ANON_KEY =
+  (import.meta.env?.VITE_SUPABASE_ANON_KEY as string) ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF3a3RpZmZieHdod3Voa21wZnZ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTU0MDkxNjQsImV4cCI6MjExMDk4NTE2NH0.fwTtEMn1sJbNE48kc-1L87_aNn5J3jYIwCgEffY3Hjs';
 
 export const DEFAULT_DATABASE_MAPS: FacilityMapData[] = [
