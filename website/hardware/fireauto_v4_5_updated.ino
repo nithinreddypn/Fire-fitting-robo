@@ -487,64 +487,51 @@ void updateScreenPriority() {
 // ============================================================
 //   ULTRASONIC TIMING MEASUREMENT (HC-SR04)
 //   Hardware: TRIG = GPIO 5, ECHO = GPIO 18
-//   Rock-solid 3-sample median filter with settle guard
+//   Single-ping per cycle (100ms interval satisfies 60ms datasheet requirement)
+//   Rolling 3-sample median filter (noise immunity without ping collisions)
 // ============================================================
-int readUltrasonicRaw(int trigPin, int echoPin) {
-  // Settle TRIG LOW
+int readUltrasonic(int trigPin, int echoPin) {
+  // Ensure TRIG is firmly LOW
   digitalWrite(trigPin, LOW);
   delayMicroseconds(4);
 
-  // Settle guard: If ECHO is stuck HIGH from previous sonic bounce, wait up to 1ms
-  unsigned long settleStart = micros();
-  while (digitalRead(echoPin) == HIGH && (micros() - settleStart) < 1000) {
-    delayMicroseconds(10);
-  }
-
-  // Trigger pulse: 10µs HIGH
+  // Send clean 10µs trigger pulse to HC-SR04
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  // pulseIn with 22ms timeout (~3.8m range)
-  unsigned long dur = pulseIn(echoPin, HIGH, 22000);
-  if (dur == 0) return -1; // Echo missed or out of range
-  int cm = (int)(dur / 58);
-  if (cm < 2 || cm > US_MAX_CM) return -1;
-  return cm;
-}
+  // 26ms timeout (~4.5m range)
+  unsigned long duration = pulseIn(echoPin, HIGH, 26000);
 
-int readUltrasonic(int trigPin, int echoPin) {
-  int samples[3];
-  int validCount = 0;
-
-  for (int i = 0; i < 3; i++) {
-    int r = readUltrasonicRaw(trigPin, echoPin);
-    if (r > 0) {
-      samples[validCount++] = r;
-    }
-    if (i < 2) delayMicroseconds(800); // Inter-ping acoustic settle delay
+  int rawCm;
+  if (duration == 0) {
+    rawCm = US_MAX_CM; // No echo received (path is clear)
+  } else {
+    int cm = (int)(duration / 58);
+    rawCm = constrain(cm, 2, US_MAX_CM);
   }
 
-  static int lastValidDist = US_MAX_CM;
+  // Rolling 3-sample median filter
+  static int hist[3] = { US_MAX_CM, US_MAX_CM, US_MAX_CM };
+  static uint8_t idx = 0;
+  static bool seeded = false;
 
-  if (validCount == 0) {
-    // If all 3 samples missed, preserve last valid reading (prevents dropouts)
-    return lastValidDist;
+  if (!seeded) {
+    hist[0] = rawCm; hist[1] = rawCm; hist[2] = rawCm;
+    seeded = true;
+    return rawCm;
   }
 
-  // Sort valid samples to obtain median
-  for (int i = 0; i < validCount - 1; i++) {
-    for (int j = i + 1; j < validCount; j++) {
-      if (samples[i] > samples[j]) {
-        int tmp = samples[i];
-        samples[i] = samples[j];
-        samples[j] = tmp;
-      }
-    }
-  }
+  hist[idx] = rawCm;
+  idx = (idx + 1) % 3;
 
-  int median = samples[validCount / 2];
-  lastValidDist = median;
+  // 3-point median
+  int a = hist[0], b = hist[1], c = hist[2];
+  int median;
+  if ((a <= b && b <= c) || (c <= b && b <= a))      median = b;
+  else if ((b <= a && a <= c) || (c <= a && a <= b)) median = a;
+  else                                               median = c;
+
   return median;
 }
 
@@ -726,7 +713,7 @@ void taskSensors(void* param) {
         if (dist > 0 && dist < US_MAX_CM) {
           Serial.print(dist); Serial.print("cm ");
         } else {
-          Serial.print("CLR ");
+          Serial.print("CLR (>4m) ");
         }
         Serial.print("| Servo="); Serial.print(servoAngle); Serial.println("deg");
       }
@@ -989,7 +976,7 @@ void setup() {
   // Ultrasonic Pin Configuration (Single Center Sonar: TRIG=5, ECHO=18)
   if (US_CONNECTED) {
     pinMode(US_TRIG_PIN, OUTPUT);
-    pinMode(US_ECHO_PIN, INPUT);
+    pinMode(US_ECHO_PIN, INPUT_PULLDOWN);
     digitalWrite(US_TRIG_PIN, LOW);
     Serial.println("[INIT] Single HC-SR04 Sonar -> TRIG: GPIO 5, ECHO: GPIO 18 Initialized");
   }

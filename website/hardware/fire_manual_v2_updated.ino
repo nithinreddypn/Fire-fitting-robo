@@ -352,56 +352,45 @@ void taskAcousticOutput(void *pvParameters) {
 }
 
 
-// ── Ultrasonic Distance Read Function (3-Sample Median Filter with Settle Guard) ──
-long readUltrasonicRawCM() {
+// ── Ultrasonic Distance Read Function (Single-ping with Rolling 3-Sample Median Filter) ──
+long readUltrasonicDistanceCM() {
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
   delayMicroseconds(4);
-
-  // Settle guard: wait if ECHO line is lingering HIGH
-  unsigned long settleStart = micros();
-  while (digitalRead(ULTRASONIC_ECHO_PIN) == HIGH && (micros() - settleStart) < 1000) {
-    delayMicroseconds(10);
-  }
 
   digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
 
-  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 22000); // 22ms timeout (~3.8m max)
-  if (duration == 0) return -1;
-  int cm = (int)(duration / 58);
-  if (cm < 2 || cm > 400) return -1;
-  return cm;
-}
+  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 26000); // 26ms timeout (~4.5m max)
 
-long readUltrasonicDistanceCM() {
-  long samples[3];
-  int validCount = 0;
-
-  for (int i = 0; i < 3; i++) {
-    long r = readUltrasonicRawCM();
-    if (r > 0) {
-      samples[validCount++] = r;
-    }
-    if (i < 2) delayMicroseconds(800);
+  long rawCm;
+  if (duration == 0) {
+    rawCm = 400; // Clear / no obstacle
+  } else {
+    long cm = duration / 58;
+    rawCm = constrain(cm, 2, 400);
   }
 
-  static long lastValidDist = 400;
-  if (validCount == 0) return lastValidDist;
+  // Rolling 3-sample median filter
+  static long hist[3] = { 400, 400, 400 };
+  static uint8_t idx = 0;
+  static bool seeded = false;
 
-  // Sort samples for median
-  for (int i = 0; i < validCount - 1; i++) {
-    for (int j = i + 1; j < validCount; j++) {
-      if (samples[i] > samples[j]) {
-        long tmp = samples[i];
-        samples[i] = samples[j];
-        samples[j] = tmp;
-      }
-    }
+  if (!seeded) {
+    hist[0] = rawCm; hist[1] = rawCm; hist[2] = rawCm;
+    seeded = true;
+    return rawCm;
   }
 
-  long median = samples[validCount / 2];
-  lastValidDist = median;
+  hist[idx] = rawCm;
+  idx = (idx + 1) % 3;
+
+  long a = hist[0], b = hist[1], c = hist[2];
+  long median;
+  if ((a <= b && b <= c) || (c <= b && b <= a))      median = b;
+  else if ((b <= a && a <= c) || (c <= a && a <= b)) median = a;
+  else                                               median = c;
+
   return median;
 }
 
@@ -686,7 +675,7 @@ void setUpPinModes()
 
   // Setup Ultrasonic Sensor pins
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
-  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT_PULLDOWN);
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
   Serial.println("Ultrasonic pins initialized (TRIG=5, ECHO=18)");
 
