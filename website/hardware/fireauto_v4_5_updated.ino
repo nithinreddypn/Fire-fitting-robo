@@ -153,6 +153,11 @@ volatile GpsData gpsData = { 0.0, 0.0, false, 0, 99.9 };
 #define OBSTACLE_SHOW_AFTER_MS  3000
 #define OBSTACLE_HOLD_MS        2000
 
+// Sensor diagnostic / component error status flags
+volatile bool compErrorUS = false;
+volatile bool compErrorL  = false;
+volatile bool compErrorR  = false;
+
 // ============================================================
 //   WIFI & SUPABASE CLOUD ENDPOINTS (LIVE SYNCHRONIZATION)
 // ============================================================
@@ -773,7 +778,7 @@ void taskBuzzer(void* param) {
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       fire     = sData.fireConfirmed;
       obstacle = sData.obstacleLeft || sData.obstacleRight;
-      err      = compErrorL || compErrorR;
+      err      = compErrorUS || compErrorL || compErrorR;
       xSemaphoreGive(dataMutex);
     }
 
@@ -1111,8 +1116,9 @@ void postToSupabase(const char* ts, int intensity, int active,
   doc["sensor_values"]       = vs;
   doc["relay_status"]        = relay ? "ON" : "OFF";
 
-  if (US_FL_CONNECTED && !compErrorL) doc["dist_left"]  = distL;
-  if (US_FR_CONNECTED && !compErrorR) doc["dist_right"] = distR;
+  if (US_FL_CONNECTED && !compErrorL && !compErrorUS) doc["dist_left"]  = distL;
+  if (US_FR_CONNECTED && !compErrorR)                 doc["dist_right"] = distR;
+  if (US_CONNECTED && !compErrorUS)                   doc["dist_cm"]    = distL;
 
   // Include precise GPS fix coordinates
   if (gpsValid) {
@@ -1368,8 +1374,8 @@ void drawComponentError() {
 
   display.setTextSize(1);
   int y = 19;
-  if (compErrorL && US_FL_CONNECTED) {
-    display.setCursor(4, y); display.print("US-Left : NO SIGNAL"); y += 10;
+  if ((compErrorUS || compErrorL) && US_FL_CONNECTED) {
+    display.setCursor(4, y); display.print("Sonar   : NO SIGNAL"); y += 10;
   }
   if (compErrorR && US_FR_CONNECTED) {
     display.setCursor(4, y); display.print("US-Right: NO SIGNAL"); y += 10;
