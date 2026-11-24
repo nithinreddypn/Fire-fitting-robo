@@ -14,17 +14,19 @@
 // ── Motor Pins (PWM on IN pins directly, EnA & EnB removed) ──
 #define RIGHT_MOTOR_IN1     14  // Right Motor IN1 (PWM Forward)
 #define RIGHT_MOTOR_IN2     27  // Right Motor IN2 (PWM Backward)
-#define LEFT_MOTOR_IN1      25  // Left Motor IN1  (PWM Forward - Connected to GPIO 25)
-#define LEFT_MOTOR_IN2      23  // Left Motor IN2  (PWM Backward - Connected to GPIO 23)
+#define LEFT_MOTOR_IN1      23  // Left Motor IN1  (PWM Forward - Connected to GPIO 23)
+#define LEFT_MOTOR_IN1_ALT  19  // Left Motor IN1  (PWM Forward - Parallel Mirror Pin on GPIO 19)
+#define LEFT_MOTOR_IN2      25  // Left Motor IN2  (PWM Backward - Connected to GPIO 25)
 
-// Dedicated LEDC PWM Channels for Motors (Using Dedicated Hardware Timers 2 & 3: Channels 4-7)
+// Dedicated LEDC PWM Channels for Motors (Using Dedicated Hardware Timers 2 & 3: Channels 4-7, 14)
 // Timers 0 & 1 are strictly reserved for 50Hz Servos. Motors run at 1000Hz on Timers 2 & 3.
 #define MOTOR_PWM_FREQ 1000  // 1 kHz smooth PWM
 #define MOTOR_PWM_RES  8     // 8-bit resolution (0-255)
-#define CH_RM_IN1     4      // Dedicated Hardware Timer 2 (Channel 4) -> Right Motor Forward
-#define CH_RM_IN2     5      // Dedicated Hardware Timer 2 (Channel 5) -> Right Motor Backward
-#define CH_LM_IN1     6      // Dedicated Hardware Timer 3 (Channel 6) -> Left Motor Forward
-#define CH_LM_IN2     7      // Dedicated Hardware Timer 3 (Channel 7) -> Left Motor Backward
+#define CH_RM_IN1      4     // Dedicated Hardware Timer 2 (Channel 4) -> Right Motor Forward
+#define CH_RM_IN2      5     // Dedicated Hardware Timer 2 (Channel 5) -> Right Motor Backward
+#define CH_LM_IN1      6     // Dedicated Hardware Timer 3 (Channel 6) -> Left Motor Forward (GPIO 23)
+#define CH_LM_IN2      7     // Dedicated Hardware Timer 3 (Channel 7) -> Left Motor Backward (GPIO 25)
+#define CH_LM_IN1_ALT  14    // Dedicated Hardware Timer 3 (Channel 14) -> Left Motor Forward Mirror (GPIO 19)
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   #define MOTOR_PWM_ATTACH(pin, ch, freq, res) ledcAttach(pin, freq, res)
@@ -392,20 +394,23 @@ void rotateMotor(int motorNumber, int motorDirection)
   {
     if (motorDirection == FORWARD)
     {
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2, CH_LM_IN2, 0);
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1, CH_LM_IN1, speed);
-      Serial.printf("Left Motor: FORWARD on Pin %d (PWM:%d)\n", LEFT_MOTOR_IN1, speed);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     speed);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, speed);
+      Serial.printf("Left Motor: FORWARD on Pins %d & %d (PWM:%d)\n", LEFT_MOTOR_IN1, LEFT_MOTOR_IN1_ALT, speed);
     }
     else if (motorDirection == BACKWARD)
     {
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1, CH_LM_IN1, 0);
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2, CH_LM_IN2, speed);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, 0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     speed);
       Serial.printf("Left Motor: BACKWARD on Pin %d (PWM:%d)\n", LEFT_MOTOR_IN2, speed);
     }
     else
     {
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1, CH_LM_IN1, 0);
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2, CH_LM_IN2, 0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, 0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
     }
   }
 }
@@ -581,36 +586,41 @@ void setUpPinModes()
   dac_output_disable(DAC_CHANNEL_1);
 
   // Set motor pins to OUTPUT and ground them immediately to prevent any startup glitch
-  pinMode(RIGHT_MOTOR_IN1, OUTPUT);
-  pinMode(RIGHT_MOTOR_IN2, OUTPUT);
-  pinMode(LEFT_MOTOR_IN1,  OUTPUT);
-  pinMode(LEFT_MOTOR_IN2,  OUTPUT);
+  pinMode(RIGHT_MOTOR_IN1,    OUTPUT);
+  pinMode(RIGHT_MOTOR_IN2,    OUTPUT);
+  pinMode(LEFT_MOTOR_IN1,     OUTPUT);
+  pinMode(LEFT_MOTOR_IN1_ALT, OUTPUT);
+  pinMode(LEFT_MOTOR_IN2,     OUTPUT);
 
-  digitalWrite(RIGHT_MOTOR_IN1, LOW);
-  digitalWrite(RIGHT_MOTOR_IN2, LOW);
-  digitalWrite(LEFT_MOTOR_IN1,  LOW);
-  digitalWrite(LEFT_MOTOR_IN2,  LOW);
+  digitalWrite(RIGHT_MOTOR_IN1,    LOW);
+  digitalWrite(RIGHT_MOTOR_IN2,    LOW);
+  digitalWrite(LEFT_MOTOR_IN1,     LOW);
+  digitalWrite(LEFT_MOTOR_IN1_ALT, LOW);
+  digitalWrite(LEFT_MOTOR_IN2,     LOW);
 
   // Set maximum 40mA drive capability for crisp H-bridge gate transitions
-  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN1, GPIO_DRIVE_CAP_3);
-  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN2, GPIO_DRIVE_CAP_3);
-  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1,  GPIO_DRIVE_CAP_3);
-  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2,  GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN1,    GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN2,    GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1,     GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1_ALT, GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2,     GPIO_DRIVE_CAP_3);
 
-  // Attach Hardware Timers 2 & 3 (Channels 4, 5, 6, 7) at 1000Hz (1kHz)
-  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN1, CH_RM_IN1, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
-  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN2, CH_RM_IN2, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
-  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1,  CH_LM_IN1, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
-  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2,  CH_LM_IN2, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  // Attach Hardware Timers 2 & 3 at 1000Hz (1kHz)
+  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN1,    CH_RM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN2,    CH_RM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1,     CH_LM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2,     CH_LM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
 
   // Initialize motor PWM duties to 0 (Complete Standstill)
-  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1, CH_RM_IN1, 0);
-  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2, CH_RM_IN2, 0);
-  MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,  CH_LM_IN1, 0);
-  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,  CH_LM_IN2, 0);
+  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1,    CH_RM_IN1,     0);
+  MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2,    CH_RM_IN2,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, 0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
 
   moveCar(STOP);
-  Serial.println("Motor pins initialized (Dedicated Channels 4-7, Timers 2 & 3; 40mA drive; Absolute Standstill)");
+  Serial.println("Motor pins initialized (Dedicated Channels 4,5,6,7,14, Timers 2 & 3; 40mA drive; Absolute Standstill)");
 
   // ── 2. Servos Configuration (Strictly restricted to Hardware Timers 0 & 1 at 50Hz) ──
   // Keeping Servos on Timers 0 & 1 completely isolates them from Motors on Timers 2 & 3

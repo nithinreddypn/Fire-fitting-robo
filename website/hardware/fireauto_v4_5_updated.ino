@@ -62,25 +62,25 @@ bool oledOK = false;
 volatile bool relayOn = false;
 
 // ============================================================
-//   AUTONOMOUS MOTOR DRIVER (Dedicated Hardware Timers 2 & 3: Channels 4-7)
+//   AUTONOMOUS MOTOR DRIVER (Dedicated Hardware Timers 2 & 3: Channels 4-7, 14)
 //   Hardware Pins:
 //     Right Motor: GPIO 14 (IN1 Forward),  GPIO 27 (IN2 Backward)
-//     Left Motor:  GPIO 25 (IN1 Forward),  GPIO 26 (IN2 Backward)
-//                  GPIO 23 (IN2 Backward Mirror via GPIO Matrix)
+//     Left Motor:  GPIO 23 (IN1 Forward),  GPIO 25 (IN2 Backward)
+//                  GPIO 19 (IN1 Forward Mirror)
 // ============================================================
 #define RIGHT_MOTOR_IN1     14
 #define RIGHT_MOTOR_IN2     27
-#define LEFT_MOTOR_IN1      25
-#define LEFT_MOTOR_IN2      26
-#define LEFT_MOTOR_IN2_ALT  23
+#define LEFT_MOTOR_IN1      23
+#define LEFT_MOTOR_IN1_ALT  19
+#define LEFT_MOTOR_IN2      25
 
 #define MOTOR_PWM_FREQ 1000
 #define MOTOR_PWM_RES  8
-#define CH_RM_IN1     4
-#define CH_RM_IN2     5
-#define CH_LM_IN1     6
-#define CH_LM_IN2     7
-#define CH_LM_IN2_ALT 7
+#define CH_RM_IN1      4
+#define CH_RM_IN2      5
+#define CH_LM_IN1      6
+#define CH_LM_IN2      7
+#define CH_LM_IN1_ALT  14
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   #define MOTOR_PWM_ATTACH(pin, ch, freq, res) ledcAttach(pin, freq, res)
@@ -296,20 +296,20 @@ void rotateMotor(int motorNumber, int motorDirection, int targetSpeed)
     if (motorDirection == FORWARD)
     {
       MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
       MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     speed);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, speed);
     }
     else if (motorDirection == BACKWARD)
     {
       MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, 0);
       MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     speed);
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, speed);
     }
     else
     {
       MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+      MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, 0);
       MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
-      MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
     }
   }
 }
@@ -356,35 +356,35 @@ void setupMotors() {
   pinMode(RIGHT_MOTOR_IN1,    OUTPUT);
   pinMode(RIGHT_MOTOR_IN2,    OUTPUT);
   pinMode(LEFT_MOTOR_IN1,     OUTPUT);
+  pinMode(LEFT_MOTOR_IN1_ALT, OUTPUT);
   pinMode(LEFT_MOTOR_IN2,     OUTPUT);
-  pinMode(LEFT_MOTOR_IN2_ALT, OUTPUT);
 
   digitalWrite(RIGHT_MOTOR_IN1,    LOW);
   digitalWrite(RIGHT_MOTOR_IN2,    LOW);
   digitalWrite(LEFT_MOTOR_IN1,     LOW);
+  digitalWrite(LEFT_MOTOR_IN1_ALT, LOW);
   digitalWrite(LEFT_MOTOR_IN2,     LOW);
-  digitalWrite(LEFT_MOTOR_IN2_ALT, LOW);
 
   gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN1,    GPIO_DRIVE_CAP_3);
   gpio_set_drive_capability((gpio_num_t)RIGHT_MOTOR_IN2,    GPIO_DRIVE_CAP_3);
   gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1,     GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN1_ALT, GPIO_DRIVE_CAP_3);
   gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2,     GPIO_DRIVE_CAP_3);
-  gpio_set_drive_capability((gpio_num_t)LEFT_MOTOR_IN2_ALT, GPIO_DRIVE_CAP_3);
 
   MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN1,    CH_RM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
   MOTOR_PWM_ATTACH(RIGHT_MOTOR_IN2,    CH_RM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
   MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1,     CH_LM_IN1,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
   MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2,     CH_LM_IN2,     MOTOR_PWM_FREQ, MOTOR_PWM_RES);
-  MOTOR_PWM_ATTACH(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
 
   MOTOR_PWM_WRITE(RIGHT_MOTOR_IN1,    CH_RM_IN1,     0);
   MOTOR_PWM_WRITE(RIGHT_MOTOR_IN2,    CH_RM_IN2,     0);
   MOTOR_PWM_WRITE(LEFT_MOTOR_IN1,     CH_LM_IN1,     0);
+  MOTOR_PWM_WRITE(LEFT_MOTOR_IN1_ALT, CH_LM_IN1_ALT, 0);
   MOTOR_PWM_WRITE(LEFT_MOTOR_IN2,     CH_LM_IN2,     0);
-  MOTOR_PWM_WRITE(LEFT_MOTOR_IN2_ALT, CH_LM_IN2_ALT, 0);
 
   moveCar(STOP);
-  Serial.println("[INIT] Autonomous Motors -> Channels 4-7 (Timers 2 & 3) Standstill Initialized");
+  Serial.println("[INIT] Autonomous Motors -> Channels 4,5,6,7,14 (Timers 2 & 3) Standstill Initialized");
 }
 
 // ============================================================
