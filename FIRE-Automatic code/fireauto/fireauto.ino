@@ -89,26 +89,22 @@ struct GpsData {
 volatile GpsData gpsData = { 0.0, 0.0, false, 0, 99.9 };
 
 // ============================================================
-//   HC-SR04 ULTRASONIC RANGE SENSORS
+//   HC-SR04 ULTRASONIC RANGE SENSOR (Single Center Sonar)
+//   Connected to ESP32: TRIG = GPIO 5, ECHO = GPIO 18
 // ============================================================
-#define US_FL_CONNECTED true
+#define US_CONNECTED true
+#define US_TRIG_PIN  5
+#define US_ECHO_PIN  18
+#define OBSTACLE_CM  30
+#define US_MAX_CM    400
+
+// Backwards compatibility aliases
+#define US_FL_CONNECTED US_CONNECTED
 #define US_FR_CONNECTED false
-
-#define US_FL_TRIG  25
-#define US_FL_ECHO  26
-#define US_FR_TRIG  27
-#define US_FR_ECHO  14
-#define OBSTACLE_CM 30
-#define US_MAX_CM   400
-
-// ============================================================
-//   COMPONENT HEALTH & WATCHDOG
-// ============================================================
-#define NO_SIGNAL_CYCLES 8
-int noSignalCountL = 0;
-int noSignalCountR = 0;
-volatile bool compErrorL = false;
-volatile bool compErrorR = false;
+#define US_FL_TRIG      US_TRIG_PIN
+#define US_FL_ECHO      US_ECHO_PIN
+#define US_FR_TRIG      US_TRIG_PIN
+#define US_FR_ECHO      US_ECHO_PIN
 
 // Priority timing intervals
 #define OBSTACLE_SHOW_AFTER_MS  3000
@@ -289,15 +285,12 @@ bool evaluateFlameSensor(int i, int rawVal, int &intensityOut) {
 void updateScreenPriority() {
   bool fire  = sData.fireConfirmed;
   bool obs   = sData.obstacleLeft || sData.obstacleRight;
-  bool anyUS = US_FL_CONNECTED || US_FR_CONNECTED;
-  bool err   = compErrorL || compErrorR;
 
-  if (!fire && !obs && err) { currentScreen = SCR_ERROR; return; }
   if (!fire && !obs) { currentScreen = SCR_NORMAL; inObstacleWindow = false; return; }
   if (fire && !obs)  { currentScreen = SCR_FIRE;   inObstacleWindow = false; return; }
-  if (!fire && obs && anyUS) { currentScreen = SCR_OBSTACLE; return; }
+  if (!fire && obs && US_CONNECTED) { currentScreen = SCR_OBSTACLE; return; }
 
-  if (fire && obs && anyUS) {
+  if (fire && obs && US_CONNECTED) {
     unsigned long now = millis();
     if (!inObstacleWindow) {
       if (fireStartTime == 0) fireStartTime = now;
@@ -372,32 +365,19 @@ void syncNTP() {
 void taskSensors(void* param) {
   TickType_t lastWake = xTaskGetTickCount();
   while (1) {
-    int dL = US_MAX_CM, dR = US_MAX_CM;
-    if (US_FL_CONNECTED) dL = readUltrasonic(US_FL_TRIG, US_FL_ECHO);
-    if (US_FR_CONNECTED) dR = readUltrasonic(US_FR_TRIG, US_FR_ECHO);
-
-    if (US_FL_CONNECTED) {
-      noSignalCountL = (dL >= US_MAX_CM) ? noSignalCountL + 1 : 0;
-      compErrorL = (noSignalCountL >= NO_SIGNAL_CYCLES);
-    }
-    if (US_FR_CONNECTED) {
-      noSignalCountR = (dR >= US_MAX_CM) ? noSignalCountR + 1 : 0;
-      compErrorR = (noSignalCountR >= NO_SIGNAL_CYCLES);
+    int dist = US_MAX_CM;
+    if (US_CONNECTED) {
+      dist = readUltrasonic(US_TRIG_PIN, US_ECHO_PIN);
     }
 
     bool fireThisCycle = false;
     int  strongest = 0, strongestIdx = -1, activeCount = 0, peakInt = 0;
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      if (US_FL_CONNECTED) {
-        sData.distLeft     = dL;
-        sData.obstacleLeft = (!compErrorL && dL <= OBSTACLE_CM);
-      } else { sData.distLeft = -1; sData.obstacleLeft = false; }
-
-      if (US_FR_CONNECTED) {
-        sData.distRight     = dR;
-        sData.obstacleRight = (!compErrorR && dR <= OBSTACLE_CM);
-      } else { sData.distRight = -1; sData.obstacleRight = false; }
+      sData.distLeft      = dist;
+      sData.distRight     = dist;
+      sData.obstacleLeft  = (dist > 0 && dist <= OBSTACLE_CM);
+      sData.obstacleRight = false;
 
       // Read 5 flame sensor channels (Analog & Digital Hybrid Evaluation)
       for (int i = 0; i < NUM_SENSORS; i++) {
@@ -462,11 +442,10 @@ void taskSensors(void* param) {
         }
       }
 
-      if (sData.obstacleLeft || sData.obstacleRight) {
-        Serial.print("[OBSTACLE HAZARD]");
-        if (US_FL_CONNECTED && !compErrorL) { Serial.print(" L="); Serial.print(dL); Serial.print("cm"); }
-        if (US_FR_CONNECTED && !compErrorR) { Serial.print(" R="); Serial.print(dR); Serial.print("cm"); }
-        Serial.println(" -> ROVER BRAKE INTERLOCK");
+      if (sData.obstacleLeft) {
+        Serial.print("[OBSTACLE HAZARD] Dist=");
+        Serial.print(dist);
+        Serial.println("cm -> ROVER BRAKE INTERLOCK");
       }
 
       updateScreenPriority();
@@ -486,11 +465,10 @@ void taskSensors(void* param) {
           Serial.print(sData.values[i]); Serial.print(" ");
         }
         Serial.print("-> Status: CLEAR | ");
-        if (US_FL_CONNECTED) {
-          Serial.print("| Sonar L=");
-          if (compErrorL) Serial.print("ERR");
-          else { Serial.print(dL); Serial.print("cm"); }
-          Serial.print(" ");
+        if (US_CONNECTED) {
+          Serial.print("Sonar=");
+          Serial.print(dist);
+          Serial.print("cm ");
         }
         Serial.print("| Servo="); Serial.print(servoAngle); Serial.println("deg");
       }
@@ -747,14 +725,12 @@ void setup() {
     Serial.println("[WARN] OLED Display Not Detected at 0x3C");
   }
 
-  // Ultrasonic Pin Configuration
-  if (US_FL_CONNECTED) {
-    pinMode(US_FL_TRIG, OUTPUT); pinMode(US_FL_ECHO, INPUT);
-    digitalWrite(US_FL_TRIG, LOW);
-  }
-  if (US_FR_CONNECTED) {
-    pinMode(US_FR_TRIG, OUTPUT); pinMode(US_FR_ECHO, INPUT);
-    digitalWrite(US_FR_TRIG, LOW);
+  // Ultrasonic Pin Configuration (Single Center Sonar: TRIG=5, ECHO=18)
+  if (US_CONNECTED) {
+    pinMode(US_TRIG_PIN, OUTPUT);
+    pinMode(US_ECHO_PIN, INPUT);
+    digitalWrite(US_TRIG_PIN, LOW);
+    Serial.println("[INIT] Single HC-SR04 Sonar -> TRIG: GPIO 5, ECHO: GPIO 18 Initialized");
   }
 
   auto boot = [](int pct, const char* msg) {
@@ -1171,14 +1147,9 @@ void drawObstacleAlert() {
   }
 
   int yp = 31;
-  if (US_FL_CONNECTED && !compErrorL) {
-    char buf[20]; snprintf(buf, sizeof(buf), "L:%dcm %s", dL, obsL ? "STOP" : "OK");
-    display.setCursor(4, yp); display.print(buf); yp += 10;
-  }
-  if (US_FR_CONNECTED && !compErrorR) {
-    char buf[20]; snprintf(buf, sizeof(buf), "R:%dcm %s", dR, obsR ? "STOP" : "OK");
-    display.setCursor(4, yp); display.print(buf); yp += 10;
-  }
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Sonar: %dcm %s", dL, obsL ? "STOP" : "OK");
+  display.setCursor(4, yp); display.print(buf); yp += 10;
 
   display.drawLine(0, yp + 1, SCREEN_W, yp + 1, SH110X_WHITE);
   display.setCursor(4, yp + 5);
